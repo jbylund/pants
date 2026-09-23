@@ -44,6 +44,7 @@ from pants.engine.target import (
     SourcesField,
     Target,
     TargetRootsToFieldSetsRequest,
+    Targets,
     UnexpandedTargets,
 )
 from pants.engine.unions import UnionMembership, union
@@ -311,16 +312,35 @@ async def get_target_data(
     targets_with_sources = [tgt for tgt in sorted_targets if tgt.has_field(SourcesField)]
 
     # When determining dependencies, we replace target generators with their generated targets.
-    dependencies_per_target = await concurrently(
+    # Admit target types round-robin so that one slow kind of target (e.g. JVM targets waiting on a
+    # JDK download) cannot monopolize the bounded `concurrently()` window.
+    items_by_type: dict[type[Target], list[tuple[int, Target]]] = collections.defaultdict(list)
+    for index, target in enumerate(sorted_targets):
+        items_by_type[type(target)].append((index, target))
+    partitions = collections.deque(iter(items) for items in items_by_type.values())
+    scheduled_items: list[tuple[int, Target]] = []
+    while partitions:
+        partition = partitions.popleft()
+        try:
+            scheduled_items.append(next(partition))
+        except StopIteration:
+            continue
+        partitions.append(partition)
+
+    dependencies_in_scheduled_order = await concurrently(
         resolve_targets(
             **implicitly(
                 DependenciesRequest(
-                    tgt.get(Dependencies), should_traverse_deps_predicate=AlwaysTraverseDeps()
+                    target.get(Dependencies),
+                    should_traverse_deps_predicate=AlwaysTraverseDeps(),
                 )
             )
         )
-        for tgt in sorted_targets
+        for _, target in scheduled_items
     )
+    dependencies_per_target: list[Targets] = [Targets()] * len(sorted_targets)
+    for (index, _), dependencies in zip(scheduled_items, dependencies_in_scheduled_order):
+        dependencies_per_target[index] = dependencies
     hydrated_sources_per_target = await concurrently(
         hydrate_sources(HydrateSourcesRequest(tgt[SourcesField]), **implicitly())
         for tgt in targets_with_sources
