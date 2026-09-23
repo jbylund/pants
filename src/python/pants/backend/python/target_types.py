@@ -160,7 +160,7 @@ class PythonResolveField(StringField, AsyncFieldMixin, ResolveLikeField):
         if not python_setup.enable_resolves:
             return "<ignore>"
         resolve = self.value or python_setup.default_resolve
-        if resolve not in python_setup.resolves:
+        if not python_setup.is_known_resolve(resolve):
             raise UnrecognizedResolveNamesError(
                 [resolve],
                 python_setup.resolves.keys(),
