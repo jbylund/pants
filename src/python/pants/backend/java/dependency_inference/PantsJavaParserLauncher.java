@@ -115,9 +115,29 @@ public class PantsJavaParserLauncher {
     return new ArrayList<>();
   }
 
+  /**
+   * Analyzes each pair of (output path, source path) arguments. With a single pair, a failure
+   * fails the process. With several pairs, a failure to analyze one source is recorded in a file
+   * next to its output path (with the suffix `.error`), and the other sources are still analyzed.
+   */
   public static void main(String[] args) throws Exception {
-    String analysisOutputPath = args[0];
-    String sourceToAnalyze = args[1];
+    if (args.length == 2) {
+      analyze(args[0], args[1]);
+      return;
+    }
+    for (int i = 0; i + 1 < args.length; i += 2) {
+      try {
+        analyze(args[i], args[i + 1]);
+      } catch (Throwable t) {
+        java.nio.file.Files.write(
+            new File(args[i] + ".error").toPath(),
+            String.valueOf(t).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+      }
+    }
+  }
+
+  private static void analyze(String analysisOutputPath, String sourceToAnalyze)
+      throws Exception {
 
     // NB: We hardcode the most permissive language level in order to capture all potential
     // sources of symbols. If certain syntax ends up deprecated in future versions, we may need to
