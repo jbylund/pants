@@ -35,6 +35,17 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class PathGlobsBatch:
+    """Many PathGlobs, to snapshot together (see `path_globs_to_snapshots`)."""
+
+    path_globs: tuple[PathGlobs, ...]
+
+
+class Snapshots(Collection[Snapshot]):
+    """The Snapshots of a `PathGlobsBatch`, in the same order."""
+
+
+@dataclass(frozen=True)
 class Paths:
     """A Paths object is a collection of sorted file paths and dir paths.
 

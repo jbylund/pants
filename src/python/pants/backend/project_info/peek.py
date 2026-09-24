@@ -20,16 +20,20 @@ from pants.core.goals.test import Test, TestFieldSet
 from pants.engine.addresses import Address, Addresses
 from pants.engine.collection import Collection
 from pants.engine.console import Console
-from pants.engine.environment import EnvironmentName
-from pants.engine.fs import Snapshot
+from pants.engine.environment import ChosenLocalEnvironmentName, EnvironmentName
+from pants.engine.fs import PathGlobsBatch, Snapshot
 from pants.engine.goal import Goal, GoalSubsystem, Outputting
 from pants.engine.internals.build_files import (
     _get_target_family_and_adaptor_for_dep_rules,
     get_dependencies_rule_application,
 )
 from pants.engine.internals.dep_rules import DependencyRuleApplication, DependencyRuleSet
-from pants.engine.internals.graph import hydrate_sources, resolve_targets
-from pants.engine.internals.specs_rules import find_valid_field_sets_for_target_roots
+from pants.engine.internals.graph import (
+    filter_targets,
+    resolve_dependencies,
+    resolve_targets_for_addresses,
+)
+from pants.engine.intrinsics import path_globs_to_snapshots
 from pants.engine.rules import Rule, collect_rules, concurrently, goal_rule, implicitly, rule
 from pants.engine.target import (
     AlwaysTraverseDeps,
@@ -38,15 +42,14 @@ from pants.engine.target import (
     DependenciesRuleApplicationRequest,
     Field,
     FieldSet,
-    HydrateSourcesRequest,
     ImmutableValue,
-    NoApplicableTargetsBehavior,
     SourcesField,
     Target,
-    TargetRootsToFieldSetsRequest,
+    TargetTypesToGenerateTargetsRequests,
     UnexpandedTargets,
 )
 from pants.engine.unions import UnionMembership, union
+from pants.option.bootstrap_options import UnmatchedBuildFileGlobs
 from pants.option.option_types import BoolOption
 from pants.util.frozendict import FrozenDict
 from pants.util.strutil import softwrap
@@ -224,7 +227,9 @@ def describe_ruleset(ruleset: DependencyRuleSet | None) -> tuple[str, ...] | Non
     return ruleset.peek()
 
 
-async def _create_target_alias_to_goals_map() -> dict[str, tuple[str, ...]]:
+async def _create_target_alias_to_goals_map(
+    union_membership: UnionMembership,
+) -> dict[str, tuple[str, ...]]:
     """Returns a mapping from a target alias to the goals that can operate on that target.
 
     For instance, `pex_binary` would map to `("run", "package")`.
@@ -256,24 +261,29 @@ async def _create_target_alias_to_goals_map() -> dict[str, tuple[str, ...]]:
     )
     peekable_goals = [field_set_to_goal_map[fs] for fs in peekable_field_sets]
 
-    target_roots_to_field_sets_get = [
-        find_valid_field_sets_for_target_roots(
-            TargetRootsToFieldSetsRequest(
-                field_set_superclass=fs,
-                goal_description="",
-                no_applicable_targets_behavior=NoApplicableTargetsBehavior.ignore,
-            ),
-            **implicitly(),
+    # Which target aliases have at least one target applicable to each goal: the same as the
+    # aliases of `find_valid_field_sets_for_target_roots(...)` per goal, but stopping at the first
+    # applicable target of each alias rather than creating field sets for every target.
+    targets = await filter_targets(**implicitly())
+    targets_by_alias: dict[str, list[Target]] = {}
+    for tgt in targets:
+        targets_by_alias.setdefault(tgt.alias, []).append(tgt)
+
+    def applicable_aliases(field_set_superclass: type[FieldSet]) -> frozenset[str]:
+        field_set_types = union_membership.get(field_set_superclass)
+        return frozenset(
+            alias
+            for alias, tgts in targets_by_alias.items()
+            if any(
+                # Targets of one type all have the same fields, so a type without the required
+                # fields rules out every target of the alias.
+                tgts[0].has_fields(field_set_type.required_fields)
+                and any(field_set_type.is_applicable(tgt) for tgt in tgts)
+                for field_set_type in field_set_types
+            )
         )
-        for fs in peekable_field_sets
-    ]
 
-    target_roots_to_field_sets = await concurrently(target_roots_to_field_sets_get)
-
-    # Create a collection of target aliases per target roots: e.g. [frozenset(), frozenset({'pyoxidizer_binary', 'pex_binary'}), ...]
-    aliases_per_target_root: Iterable[frozenset[str]] = [
-        frozenset(tgt.alias for tgt in tgt_root.targets) for tgt_root in target_roots_to_field_sets
-    ]
+    aliases_per_target_root = [applicable_aliases(fs) for fs in peekable_field_sets]
 
     # Create a mapping from the goal name to a collection of target aliases: e.g. {'run': frozenset({'pyoxidizer_binary', 'pex_binary'}), 'test': frozenset(), ...}
     goal_to_aliases_map = dict(zip(peekable_goals, aliases_per_target_root))
@@ -293,6 +303,9 @@ async def get_target_data(
     targets: UnexpandedTargets,
     subsys: PeekSubsystem,
     union_membership: UnionMembership,
+    target_types_to_generate_requests: TargetTypesToGenerateTargetsRequests,
+    local_environment_name: ChosenLocalEnvironmentName,
+    unmatched_build_file_globs: UnmatchedBuildFileGlobs,
 ) -> TargetDatas:
     """Given a set of unexpanded targets, return a mapping of target addresses to their data.
 
@@ -311,19 +324,34 @@ async def get_target_data(
     targets_with_sources = [tgt for tgt in sorted_targets if tgt.has_field(SourcesField)]
 
     # When determining dependencies, we replace target generators with their generated targets.
-    dependencies_per_target = await concurrently(
-        resolve_targets(
-            **implicitly(
+    dependency_addresses_per_target, snapshots_per_target = await concurrently(
+        concurrently(
+            resolve_dependencies(
                 DependenciesRequest(
                     tgt.get(Dependencies), should_traverse_deps_predicate=AlwaysTraverseDeps()
+                ),
+                **implicitly(),
+            )
+            for tgt in sorted_targets
+        ),
+        # The same Snapshots that `hydrate_sources` computes (without codegen, as here), in one
+        # engine call rather than several rule calls per target.
+        path_globs_to_snapshots(
+            PathGlobsBatch(
+                tuple(
+                    tgt[SourcesField].path_globs(unmatched_build_file_globs)
+                    for tgt in targets_with_sources
                 )
             )
-        )
-        for tgt in sorted_targets
+        ),
     )
-    hydrated_sources_per_target = await concurrently(
-        hydrate_sources(HydrateSourcesRequest(tgt[SourcesField]), **implicitly())
-        for tgt in targets_with_sources
+    for tgt, snapshot in zip(targets_with_sources, snapshots_per_target):
+        tgt[SourcesField].validate_resolved_files(snapshot.files)
+    # Resolved together, rather than a rule call per target and per dependency.
+    dependencies_per_target = await resolve_targets_for_addresses(
+        dependency_addresses_per_target,
+        target_types_to_generate_requests,
+        local_environment_name,
     )
     if subsys.include_additional_info:
         additional_info_field_sets = [
@@ -348,8 +376,7 @@ async def get_target_data(
 
     # TODO: This feels like something that could be merged with the above code somewhere
     expanded_sources_map = {
-        tgt.address: hs.snapshot
-        for tgt, hs in zip(targets_with_sources, hydrated_sources_per_target)
+        tgt.address: snapshot for tgt, snapshot in zip(targets_with_sources, snapshots_per_target)
     }
 
     expanded_dependencies = [
@@ -423,6 +450,7 @@ async def peek(
     console: Console,
     subsys: PeekSubsystem,
     targets: UnexpandedTargets,
+    union_membership: UnionMembership,
 ) -> Peek:
     """Display detailed target information in JSON form.
 
@@ -434,7 +462,7 @@ async def peek(
 
     tds = await get_target_data(targets, **implicitly())
     # This method needs to be called in a @goal_rule, otherwise it fails out with Rule errors (when called in an @rule)
-    target_alias_to_goals_map = await _create_target_alias_to_goals_map()
+    target_alias_to_goals_map = await _create_target_alias_to_goals_map(union_membership)
 
     if target_alias_to_goals_map:
         # Attach the goals to the target data, in the hopes that we can pull `_create_target_alias_to_goals_map` back into `get_target_data`

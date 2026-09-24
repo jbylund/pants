@@ -42,6 +42,7 @@ from pants.engine.fs import (
     DigestSubset,
     GlobExpansionConjunction,
     NativeDownloadFile,
+    PathGlobsBatch,
     PathMetadataRequest,
     PathMetadataResult,
     Paths,
@@ -1284,6 +1285,9 @@ async def create_digest(
 async def path_globs_to_digest(
     path_globs: PathGlobs,
 ) -> Digest: ...
+async def path_globs_to_snapshots(
+    batch: PathGlobsBatch,
+) -> tuple[Snapshot, ...]: ...
 async def path_globs_to_paths(
     path_globs: PathGlobs,
 ) -> Paths: ...

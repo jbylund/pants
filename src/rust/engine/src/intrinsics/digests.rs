@@ -9,6 +9,7 @@ use fs::{
     DigestTrie, DirectoryDigest, GlobMatching, PathGlobs, PathStat, RelativePath, SymlinkBehavior,
     TypedPath,
 };
+use futures::{StreamExt, TryStreamExt};
 use hashing::{Digest, EMPTY_DIGEST};
 use pyo3::prelude::{PyModule, PyRef, PyResult, Python, pyfunction, wrap_pyfunction};
 use pyo3::types::{PyAnyMethods, PyModuleMethods, PyTuple, PyTypeMethods};
@@ -38,6 +39,7 @@ pub fn register(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(merge_digests, m)?)?;
     m.add_function(wrap_pyfunction!(path_globs_to_digest, m)?)?;
     m.add_function(wrap_pyfunction!(path_globs_to_paths, m)?)?;
+    m.add_function(wrap_pyfunction!(path_globs_to_snapshots, m)?)?;
     m.add_function(wrap_pyfunction!(remove_prefix, m)?)?;
     m.add_function(wrap_pyfunction!(path_metadata_request, m)?)?;
 
@@ -201,6 +203,45 @@ fn lift_python_path_globs(path_globs: Value) -> Result<PathGlobs, Failure> {
         Snapshot::lift_path_globs(py_path_globs)
     })
     .map_err(|e| throw(format!("Failed to parse PathGlobs: {e}")))
+}
+
+/// The Snapshots of many PathGlobs, in one call: each is the memoized Snapshot node of its PathGlobs
+/// (as `path_globs_to_digest` then `digest_to_snapshot` compute), but without rule calls and Python
+/// attaches per PathGlobs.
+#[pyfunction]
+fn path_globs_to_snapshots(batch: Value) -> PyGeneratorResponseNativeCall {
+    PyGeneratorResponseNativeCall::new(async move {
+        let context = task_get_context();
+        let all_path_globs = Python::attach(|py| {
+            batch
+                .bind(py)
+                .getattr("path_globs")
+                .and_then(|path_globs| path_globs.try_iter())
+                .map_err(|e| format!("{e}"))?
+                .map(|path_globs| {
+                    Snapshot::lift_path_globs(&path_globs.map_err(|e| format!("{e}"))?)
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })
+        .map_err(|e| throw(format!("Failed to parse PathGlobs: {e}")))?;
+        // NB: Bounded, as `concurrently` is: each pending request pins its subgraph in memory.
+        let parallelism = std::cmp::max(64, context.core.local_parallelism * 4);
+        let snapshots: Vec<store::Snapshot> =
+            futures::stream::iter(all_path_globs.into_iter().map(|path_globs| {
+                context.get(Snapshot::from_path_globs(path_globs))
+            }))
+            .buffered(parallelism)
+            .try_collect()
+            .await?;
+        Ok::<_, Failure>(Python::attach(|py| {
+            let values = snapshots
+                .into_iter()
+                .map(|snapshot| Snapshot::store_snapshot(py, snapshot))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(throw)?;
+            externs::store_tuple(py, values).map_err(Failure::from)
+        })?)
+    })
 }
 
 #[pyfunction]

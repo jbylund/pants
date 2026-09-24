@@ -685,6 +685,87 @@ async def resolve_targets(
     return Targets(expanded_targets)
 
 
+async def resolve_targets_for_addresses(
+    addresses_per_request: Sequence[Iterable[Address]],
+    target_types_to_generate_requests: TargetTypesToGenerateTargetsRequests,
+    local_environment_name: ChosenLocalEnvironmentName,
+) -> list[Targets]:
+    """The `Targets` for each of the collections of addresses.
+
+    Equivalent to `resolve_targets(**implicitly(Addresses(addresses)))` for each collection, but
+    looks up the parametrizations of each generator base address once for all of them, rather than
+    making rule calls per collection and per address.
+    """
+    addresses_per_request = [tuple(addresses) for addresses in addresses_per_request]
+    bases = sorted(
+        {
+            address.maybe_convert_to_target_generator()
+            for addresses in addresses_per_request
+            for address in addresses
+        }
+    )
+    all_parametrizations = await concurrently(
+        resolve_target_parametrizations(
+            **implicitly(
+                {
+                    _TargetParametrizationsRequest(
+                        base, description_of_origin="<infallible>"
+                    ): _TargetParametrizationsRequest,
+                    local_environment_name.val: EnvironmentName,
+                }
+            )
+        )
+        for base in bases
+    )
+    parametrizations_by_base = dict(zip(bases, all_parametrizations))
+
+    targets_by_address: dict[Address, Target] = {}
+    missing = []
+    for addresses in addresses_per_request:
+        for address in addresses:
+            if address in targets_by_address:
+                continue
+            target = parametrizations_by_base[address.maybe_convert_to_target_generator()].get(
+                address, target_types_to_generate_requests
+            )
+            if target is None:
+                missing.append(address)
+            else:
+                targets_by_address[address] = target
+    if missing:
+        # Raises the same error as resolving each address would.
+        await concurrently(
+            resolve_target(
+                WrappedTargetRequest(a, description_of_origin="<infallible>"), **implicitly()
+            )
+            for a in missing
+        )
+
+    result = []
+    for addresses in addresses_per_request:
+        # As `resolve_targets`: targets in order, then what each generator generates (or the
+        # generator itself, if it generates nothing).
+        expanded_targets: OrderedSet[Target] = OrderedSet()
+        generator_targets = []
+        for address in addresses:
+            tgt = targets_by_address[address]
+            if (
+                target_types_to_generate_requests.is_generator(tgt)
+                and not tgt.address.is_generated_target
+            ):
+                generator_targets.append(tgt)
+            else:
+                expanded_targets.add(tgt)
+        for generator in generator_targets:
+            expanded_targets.update(
+                parametrizations_by_base[
+                    generator.address.maybe_convert_to_target_generator()
+                ].generated_or_generator(generator.address)
+            )
+        result.append(Targets(expanded_targets))
+    return result
+
+
 @rule(desc="Find all targets in the project", level=LogLevel.DEBUG, _masked_types=[EnvironmentName])
 async def find_all_targets() -> AllTargets:
     tgts = await resolve_targets(
