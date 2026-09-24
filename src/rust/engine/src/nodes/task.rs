@@ -15,7 +15,7 @@ use pyo3::{Bound, IntoPyObject};
 use rule_graph::DependencyKey;
 use workunit_store::{Level, RunningWorkunit, in_workunit};
 
-use super::{NodeKey, NodeResult, Params, select, task_context};
+use super::{NodeKey, NodeResult, Params, attach_gated, select, task_context};
 use crate::context::Context;
 use crate::externs::engine_aware::EngineAwareReturnType;
 use crate::externs::{self, GeneratorInput, GeneratorResponse};
@@ -137,8 +137,11 @@ impl Task {
                 externs::AllItem::Call(call) => Self::gen_call(context, params, entry, call).await,
                 externs::AllItem::Concurrent(items) => {
                     let values = Self::gen_all(context, params, entry, items).await?;
-                    Python::attach(|py| externs::store_tuple(py, values))
-                        .map_err(|err| Python::attach(|py| Failure::from_py_err_with_gil(py, err)))
+                    attach_gated(&context.core, |py| {
+                        externs::store_tuple(py, values)
+                            .map_err(|err| Failure::from_py_err_with_gil(py, err))
+                    })
+                    .await
                 }
             }
         }
@@ -194,7 +197,10 @@ impl Task {
     ) -> NodeResult<(Value, TypeId)> {
         let mut input = GeneratorInput::Initial;
         loop {
-            let response = Python::attach(|py| externs::generator_send(py, &generator, input))?;
+            let response = attach_gated(&context.core, |py| {
+                externs::generator_send(py, &generator, input)
+            })
+            .await?;
             match response {
                 GeneratorResponse::NativeCall(call) => {
                     let _blocking_token = workunit.blocking();
@@ -227,7 +233,8 @@ impl Task {
                     match Self::gen_all(context, params.clone(), entry, items).await {
                         Ok(values) => {
                             let values_tuple_result =
-                                Python::attach(|py| externs::store_tuple(py, values));
+                                attach_gated(&context.core, |py| externs::store_tuple(py, values))
+                                    .await;
                             input = match values_tuple_result {
                                 Ok(t) => GeneratorInput::Arg(t),
                                 Err(err) => GeneratorInput::Err(err),
@@ -280,13 +287,14 @@ impl Task {
         };
 
         let args = self.args;
+        let core = context.core.clone();
 
         let (mut result_val, mut result_type) = task_context(
             context.clone(),
             self.task.side_effecting,
             &self.side_effected,
             async move {
-                Python::attach(|py| {
+                attach_gated(&core, |py| {
                     let func = self.task.func.0.value.bind(py);
 
                     // If there are explicit positional arguments, apply any computed arguments as
@@ -321,6 +329,7 @@ impl Task {
                     })
                     .map_err(Failure::from)
                 })
+                .await
             },
         )
         .await?;

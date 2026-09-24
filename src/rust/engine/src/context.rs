@@ -89,6 +89,10 @@ pub struct Core {
     pub named_caches: NamedCaches,
     pub immutable_inputs: ImmutableInputs,
     pub local_execution_root_dir: PathBuf,
+    /// When set, bounds how many engine threads may run rule Python at once. Threads waiting for a
+    /// permit park in tokio (and keep running other futures) rather than in the GIL's condvar,
+    /// where they would force a GIL switch every switch interval.
+    pub python_gate: Option<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +162,8 @@ pub struct ExecutionStrategyOptions {
     pub child_max_memory: usize,
     pub child_default_memory: usize,
     pub graceful_shutdown_timeout: Duration,
+    /// The maximum number of threads which may run rule Python at once, or 0 for no limit.
+    pub python_concurrency: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -765,6 +771,8 @@ impl Core {
             named_caches,
             immutable_inputs,
             local_execution_root_dir,
+            python_gate: (exec_strategy_opts.python_concurrency > 0)
+                .then(|| tokio::sync::Semaphore::new(exec_strategy_opts.python_concurrency)),
         })
     }
 

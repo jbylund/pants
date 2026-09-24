@@ -606,6 +606,7 @@ class ExecutionOptions:
     process_execution_cache_namespace: str | None
     process_execution_graceful_shutdown_timeout: int
     cache_content_behavior: CacheContentBehavior
+    rule_python_concurrency: int | None
 
     process_total_child_memory_usage: int | None
     process_per_child_memory_usage: int
@@ -656,6 +657,7 @@ class ExecutionOptions:
             process_execution_graceful_shutdown_timeout=bootstrap_options.process_execution_graceful_shutdown_timeout,
             process_execution_local_enable_nailgun=bootstrap_options.process_execution_local_enable_nailgun,
             cache_content_behavior=bootstrap_options.cache_content_behavior,
+            rule_python_concurrency=bootstrap_options.rule_python_concurrency,
             process_total_child_memory_usage=bootstrap_options.process_total_child_memory_usage,
             process_per_child_memory_usage=bootstrap_options.process_per_child_memory_usage,
             # Remote store setup.
@@ -751,6 +753,7 @@ DEFAULT_EXECUTION_OPTIONS = ExecutionOptions(
     use_sandboxer=False,
     local_cache=True,
     cache_content_behavior=CacheContentBehavior.fetch,
+    rule_python_concurrency=None,
     process_execution_local_enable_nailgun=True,
     process_execution_graceful_shutdown_timeout=3,
     # Remote store setup.
@@ -1226,6 +1229,22 @@ class BootstrapOptions:
             """
             The maximum number of threads to use to execute `@rule` logic. Defaults to
             a small multiple of `--rule-threads-core`.
+            """
+        ),
+    )
+    rule_python_concurrency = IntOption(
+        default=None,
+        default_help_repr="1 if the interpreter has a GIL, otherwise unbounded",
+        advanced=True,
+        help=softwrap(
+            """
+            The maximum number of `@rule` threads which may run Python code at once, or 0 for
+            no limit.
+
+            With a GIL, only one thread can run Python at a time: threads beyond the first only
+            contend for the GIL, which costs a forced switch and wasted wakeups per contended
+            acquisition. Threads waiting for their turn instead keep running the engine's
+            non-Python work (such as filesystem operations and processes).
             """
         ),
     )
