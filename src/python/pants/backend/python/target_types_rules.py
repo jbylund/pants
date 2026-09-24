@@ -730,11 +730,73 @@ class PythonValidateDependenciesRequest(ValidateDependenciesRequest):
     field_set_type = DependencyValidationFieldSet
 
 
+@dataclass(frozen=True, eq=False)
+class PythonDependenciesICValidator:
+    """Memoizes, for a run, the interpreter constraint computations of dependency validation.
+
+    They are made for every dependency edge, but depend only on field values and options, of which
+    there are few distinct combinations. (Compared by identity: `PythonSetup` is not hashable.)
+    """
+
+    python_setup: PythonSetup
+    _effective: dict[tuple, tuple[tuple[str, ...], bool]] = dataclasses.field(
+        default_factory=dict, compare=False, hash=False, repr=False
+    )
+    _contains: dict[tuple[tuple[str, ...], tuple[str, ...]], bool] = dataclasses.field(
+        default_factory=dict, compare=False, hash=False, repr=False
+    )
+
+    def effective_ics(
+        self, field: InterpreterConstraintsField, resolve: PythonResolveField | None
+    ) -> tuple[str, ...]:
+        """`field.value_or_configured_default(...)`, including its per-target Python 2 warning."""
+        key = (
+            type(field),
+            field.value,
+            None if resolve is None else (type(resolve), resolve.value),
+        )
+        entry = self._effective.get(key)
+        if entry is None:
+            ics = field.value_or_configured_default(self.python_setup, resolve)
+            warns = bool(
+                field.value
+                and self.python_setup.warn_on_python2_usage
+                and InterpreterConstraints(field.value).includes_python2()
+            )
+            self._effective[key] = (ics, warns)
+            return ics
+        ics, warns = entry
+        if warns:
+            # Once per target, as `value_or_configured_default` warns.
+            field.value_or_configured_default(self.python_setup, resolve)
+        return ics
+
+    def contains(self, dep_ics: tuple[str, ...], target_ics: tuple[str, ...]) -> bool:
+        key = (dep_ics, target_ics)
+        result = self._contains.get(key)
+        if result is None:
+            result = self._contains.setdefault(
+                key,
+                interpreter_constraints_contains(
+                    dep_ics, target_ics, self.python_setup.interpreter_versions_universe
+                ),
+            )
+        return result
+
+
+@rule
+async def python_dependencies_ic_validator(
+    python_setup: PythonSetup,
+) -> PythonDependenciesICValidator:
+    return PythonDependenciesICValidator(python_setup)
+
+
 @rule
 async def validate_python_dependencies(
     request: PythonValidateDependenciesRequest,
-    python_setup: PythonSetup,
+    ic_validator: PythonDependenciesICValidator,
 ) -> ValidatedDependencies:
+    description_of_origin = f"the dependencies of {request.field_set.address}"
     root_target, dependencies = await concurrently(
         resolve_target(
             WrappedTargetRequest(
@@ -745,9 +807,7 @@ async def validate_python_dependencies(
         ),
         concurrently(
             resolve_target(
-                WrappedTargetRequest(
-                    d, description_of_origin=f"the dependencies of {request.field_set.address}"
-                ),
+                WrappedTargetRequest(d, description_of_origin=description_of_origin),
                 **implicitly(),
             )
             for d in request.dependencies
@@ -764,8 +824,8 @@ async def validate_python_dependencies(
         )
         target_ics = tuple(str(ic) for ic in effective_ics)
     else:
-        target_ics = request.field_set.interpreter_constraints.value_or_configured_default(
-            python_setup,
+        target_ics = ic_validator.effective_ics(
+            request.field_set.interpreter_constraints,
             root_target.target[PythonResolveField]
             if root_target.target.has_field(PythonResolveField)
             else None,
@@ -774,13 +834,11 @@ async def validate_python_dependencies(
     for dep in dependencies:
         if not dep.target.has_field(InterpreterConstraintsField):
             continue
-        dep_ics = dep.target[InterpreterConstraintsField].value_or_configured_default(
-            python_setup,
+        dep_ics = ic_validator.effective_ics(
+            dep.target[InterpreterConstraintsField],
             dep.target[PythonResolveField] if dep.target.has_field(PythonResolveField) else None,
         )
-        if not interpreter_constraints_contains(
-            dep_ics, target_ics, python_setup.interpreter_versions_universe
-        ):
+        if not ic_validator.contains(dep_ics, target_ics):
             non_subset_items.append(f"{dep_ics}: {dep.target.address}")
 
     if non_subset_items:
