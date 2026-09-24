@@ -50,7 +50,7 @@ class Glob:
         return cls(pattern, re.compile(glob_to_regexp(pattern)))
 
     def match(self, value: str) -> bool:
-        return bool(re.match(self.regexp, value))
+        return bool(self.regexp.match(value))
 
     def __str__(self) -> str:
         return self.raw
@@ -130,23 +130,34 @@ class PathGlob:
 
     def _match_path(self, path: str, base: str) -> str | None:
         if self.anchor_mode is PathGlobAnchorMode.INVOKED_PATH:
-            path = os.path.relpath(path or ".", base + "/.." * self.uplvl)
-            if path.startswith(".."):
-                # The `path` is not in the sub tree of `base`.
-                return None
+            return _invoked_path(path, base, self.uplvl)
         return path.lstrip(".")
 
     def match(self, path: str, base: str) -> bool:
         match_path = self._match_path(path, base)
-        return (
-            False
-            if match_path is None
-            else bool(
-                (re.search if self.anchor_mode is PathGlobAnchorMode.FLOATING else re.match)(
-                    self.glob, match_path
-                )
-            )
-        )
+        if match_path is None:
+            return False
+        if self.anchor_mode is PathGlobAnchorMode.FLOATING:
+            return self.glob.search(match_path) is not None
+        return self.glob.match(match_path) is not None
+
+
+# `os.path.relpath` normalizes both paths (with a `getcwd` call) on every call, and the same few
+# (path, base) pairs recur for every dependency edge: a pure function of its arguments, so cached.
+_INVOKED_PATHS: dict[tuple[str, str, int], str | None] = {}
+
+
+def _invoked_path(path: str, base: str, uplvl: int) -> str | None:
+    key = (path, base, uplvl)
+    try:
+        return _INVOKED_PATHS[key]
+    except KeyError:
+        pass
+    relpath = os.path.relpath(path or ".", base + "/.." * uplvl)
+    # The `path` is not in the sub tree of `base` if it starts with `..`.
+    relative = None if relpath.startswith("..") else relpath.lstrip(".")
+    _INVOKED_PATHS[key] = relative
+    return relative
 
 
 RULE_REGEXP = "|".join(
