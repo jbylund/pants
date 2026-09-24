@@ -49,6 +49,13 @@ impl LockedMap {
         compute: Py<PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let id = self.intern(py, &key)?;
+        // Hits return without detaching: a detach/attach pair is a full GIL handoff, which under a
+        // contended GIL costs far more than the lookup. No writer needs the GIL while holding
+        // `map`, so taking the read lock with the GIL held cannot deadlock. A hit inserted nothing,
+        // so it needs no `reconcile`.
+        if let Some(value) = self.cached(py, id) {
+            return Ok(value);
+        }
         let value = py.detach(move || {
             self.get_or_insert_with(id, || Python::attach(|py| compute.call0(py)))
         })?;
@@ -132,6 +139,14 @@ impl LockedMap {
                 self.map.write().remove(&id);
             });
         }
+    }
+
+    fn cached(&self, py: Python<'_>, id: u64) -> Option<Py<PyAny>> {
+        self.map
+            .read()
+            .get(&id)
+            .and_then(|cell| cell.get())
+            .map(|value| value.clone_ref(py))
     }
 
     fn get_or_insert_with(
