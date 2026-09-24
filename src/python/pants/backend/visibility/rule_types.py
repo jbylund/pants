@@ -302,6 +302,42 @@ class BuildFileVisibilityRules(BuildFileDependencyRules):
         ruleset = self.get_ruleset(address, adaptor, relpath)
         if ruleset is None:
             return None, None, None
+        # Which rule applies depends only on the ruleset, the other target and `relpath`, which
+        # many dependency edges share (e.g. every file in a directory importing the same module).
+        # Only ALLOW results are cached, so that other actions still log each time.
+        cache: dict[
+            tuple[int, Address, str],
+            tuple[
+                TargetAdaptor,
+                tuple[VisibilityRuleSet | None, DependencyRuleAction | None, str | None],
+            ],
+        ] = self._instance_cache("_action_cache")
+        key = (id(ruleset), other_address, relpath)
+        cached = cache.get(key)
+        if cached is not None and cached[0] is other_adaptor:
+            return cached[1]
+        result = self._get_action(ruleset, address, adaptor, relpath, other_address, other_adaptor)
+        if result[1] is DependencyRuleAction.ALLOW:
+            cache[key] = (other_adaptor, result)
+        return result
+
+    def _instance_cache(self, name: str) -> dict[Any, Any]:
+        # NB: On the (frozen) instance, so that caches live exactly as long as the rules they
+        # memoize (keys hold the ids of this instance's rulesets).
+        cache: dict[Any, Any] | None = self.__dict__.get(name)
+        if cache is None:
+            cache = self.__dict__.setdefault(name, {})
+        return cache
+
+    def _get_action(
+        self,
+        ruleset: VisibilityRuleSet,
+        address: Address,
+        adaptor: TargetAdaptor,
+        relpath: str,
+        other_address: Address,
+        other_adaptor: TargetAdaptor,
+    ) -> tuple[VisibilityRuleSet | None, DependencyRuleAction | None, str | None]:
         for visibility_rule in ruleset.rules:
             if visibility_rule.match(other_address, other_adaptor, relpath):
                 if visibility_rule.action != DependencyRuleAction.ALLOW:
@@ -324,10 +360,19 @@ class BuildFileVisibilityRules(BuildFileDependencyRules):
     ) -> VisibilityRuleSet | None:
         if relpath is None:
             relpath = self._get_address_relpath(address)
-        for ruleset in self.rulesets:
-            if ruleset.match(address, target, relpath):
-                return ruleset
-        return None
+        # The applicable ruleset is a property of the target, looked up for each of its edges.
+        cache: dict[tuple[Address, str], tuple[TargetAdaptor, VisibilityRuleSet | None]] = (
+            self._instance_cache("_ruleset_cache")
+        )
+        key = (address, relpath)
+        cached = cache.get(key)
+        if cached is not None and cached[0] is target:
+            return cached[1]
+        result = next(
+            (ruleset for ruleset in self.rulesets if ruleset.match(address, target, relpath)), None
+        )
+        cache[key] = (target, result)
+        return result
 
 
 @dataclass
