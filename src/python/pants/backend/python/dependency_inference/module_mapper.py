@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import functools
 import itertools
@@ -455,41 +456,44 @@ class PythonModuleOwnersRequest:
     locality: str | None = None
 
 
+@dataclass(frozen=True)
+class PythonModuleOwnersLookup:
+    """Answers `PythonModuleOwnersRequest`s in-process, for callers that look up many modules.
+
+    Looking up each import with `map_module_to_address` costs an engine call per import; this
+    computes the same result directly from the mappings, memoized for as long as the mappings (of
+    which this is a function) are unchanged.
+    """
+
+    first_party_mapping: FirstPartyPythonModuleMapping
+    third_party_mapping: ThirdPartyPythonModuleMapping
+    _cache: dict[PythonModuleOwnersRequest, PythonModuleOwners] = dataclasses.field(
+        default_factory=dict, compare=False, hash=False, repr=False
+    )
+
+    def owners(self, request: PythonModuleOwnersRequest) -> PythonModuleOwners:
+        owners = self._cache.get(request)
+        if owners is None:
+            owners = _compute_module_owners(
+                request, self.first_party_mapping, self.third_party_mapping
+            )
+            self._cache[request] = owners
+        return owners
+
+
+@rule
+async def python_module_owners_lookup(
+    first_party_mapping: FirstPartyPythonModuleMapping,
+    third_party_mapping: ThirdPartyPythonModuleMapping,
+) -> PythonModuleOwnersLookup:
+    return PythonModuleOwnersLookup(first_party_mapping, third_party_mapping)
+
+
 @rule
 async def map_module_to_address(
-    request: PythonModuleOwnersRequest,
-    first_party_mapping: FirstPartyPythonModuleMapping,
-    third_party_mapping: ThirdPartyPythonModuleMapping,
+    request: PythonModuleOwnersRequest, lookup: PythonModuleOwnersLookup
 ) -> PythonModuleOwners:
-    return module_owners(request, first_party_mapping, third_party_mapping)
-
-
-_module_owners_cache: (
-    tuple[
-        FirstPartyPythonModuleMapping,
-        ThirdPartyPythonModuleMapping,
-        dict[PythonModuleOwnersRequest, PythonModuleOwners],
-    ]
-    | None
-) = None
-
-
-def module_owners(
-    request: PythonModuleOwnersRequest,
-    first_party_mapping: FirstPartyPythonModuleMapping,
-    third_party_mapping: ThirdPartyPythonModuleMapping,
-) -> PythonModuleOwners:
-    """The owners of a module given the module mappings, cached for the latest pair of mappings."""
-    global _module_owners_cache
-    cache = _module_owners_cache
-    if cache is None or cache[0] is not first_party_mapping or cache[1] is not third_party_mapping:
-        cache = (first_party_mapping, third_party_mapping, {})
-        _module_owners_cache = cache
-    owners = cache[2].get(request)
-    if owners is None:
-        owners = _compute_module_owners(request, first_party_mapping, third_party_mapping)
-        cache[2][request] = owners
-    return owners
+    return lookup.owners(request)
 
 
 def _compute_module_owners(
