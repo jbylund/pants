@@ -23,7 +23,7 @@ use rule_graph::{DependencyKey, Query};
 use store::{self, StoreFileByDigest};
 use workunit_store::{Level, in_workunit};
 
-use crate::context::{Context, SessionCore};
+use crate::context::{Context, Core, SessionCore};
 use crate::externs;
 use crate::externs::engine_aware::{EngineAwareParameter, EngineAwareReturnType};
 use crate::python::{Failure, Key, Params, TypeId, Value, display_sorted_in_parens, throw};
@@ -70,6 +70,39 @@ pub fn task_side_effected() -> Result<(), String> {
             acquired via parameters to `@rule`s."
                 .to_owned()
         })
+}
+
+/// Runs `f` attached to Python while holding a permit of the engine's Python gate, if there is one.
+///
+/// The permit is held only for the synchronous step, never across an await, so a holder cannot wait
+/// on work that needs another permit. Side-effecting tasks bypass the gate: they may block in a
+/// step on engine work (e.g. an interactive process) that itself runs Python.
+pub(crate) async fn attach_gated<R>(core: &Core, f: impl FnOnce(Python<'_>) -> R) -> R {
+    let gate = match &core.python_gate {
+        Some(gate) if TASK_SIDE_EFFECTED.try_with(|_| ()).is_err() => gate,
+        _ => return Python::attach(f),
+    };
+    let permit = gate.acquire().await.expect("The Python gate is never closed.");
+    let result = Python::attach(f);
+    drop(permit);
+    if gate.available_permits() == 0 {
+        // The permit went straight to a waiter, which tokio woke into this worker's LIFO slot, where
+        // no other worker can steal it: yield once, so that its Python step runs before (rather than
+        // after) the engine work that follows ours. (Rescheduled after a yield, this task can be
+        // stolen by an idle worker.)
+        let mut yielded = false;
+        futures::future::poll_fn(|cx| {
+            if yielded {
+                std::task::Poll::Ready(())
+            } else {
+                yielded = true;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+    }
+    result
 }
 
 pub fn task_get_context() -> Context {
