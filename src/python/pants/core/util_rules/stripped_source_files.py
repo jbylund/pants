@@ -101,11 +101,7 @@ class StrippedFileNameRequest(EngineAwareParameter):
 @rule
 async def strip_file_name(request: StrippedFileNameRequest) -> StrippedFileName:
     source_root = await get_source_root(SourceRootRequest.for_file(request.file_path))
-    return StrippedFileName(
-        request.file_path
-        if source_root.path == "."
-        else fast_relpath(request.file_path, source_root.path)
-    )
+    return StrippedFileName(source_root.strip(request.file_path))
 
 
 class StrippedSourceFileNames(Collection[str]):

@@ -20,6 +20,7 @@ from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import Target
 from pants.option.option_types import StrListOption
 from pants.option.subsystem import Subsystem
+from pants.util.dirutil import fast_relpath
 from pants.util.docutil import doc_url
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
@@ -34,6 +35,10 @@ class SourceRoot:
     # Relative path from the buildroot.  Note that a source root at the buildroot
     # is represented as ".".
     path: str
+
+    def strip(self, file_path: str) -> str:
+        """Return `file_path`, which must be under this source root, relative to it."""
+        return file_path if self.path == "." else fast_relpath(file_path, self.path)
 
 
 @dataclass(frozen=True)
