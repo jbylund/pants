@@ -58,13 +58,12 @@ from pants.engine.addresses import Address, Addresses
 from pants.engine.internals.build_files import DELETED_ADDRESS
 from pants.engine.internals.graph import (
     OwnersRequest,
-    determine_explicitly_provided_dependencies,
+    explicitly_provided_dependencies,
     find_owners,
     resolve_targets,
 )
 from pants.engine.rules import concurrently, implicitly, rule
 from pants.engine.target import (
-    DependenciesRequest,
     ExplicitlyProvidedDependencies,
     FieldSet,
     InferDependenciesRequest,
@@ -414,8 +413,8 @@ async def resolve_parsed_dependencies(
     if not python_infer_subsystem.imports:
         parsed_imports = ParsedPythonImports([])
 
-    explicitly_provided_deps = await determine_explicitly_provided_dependencies(
-        **implicitly(DependenciesRequest(request.field_set.dependencies))
+    explicitly_provided_deps = await explicitly_provided_dependencies(
+        request.field_set.dependencies
     )
 
     # Only set locality if needed, to avoid unnecessary rule graph memoization misses.
