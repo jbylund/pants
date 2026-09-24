@@ -306,8 +306,7 @@ pub(crate) fn generator_send(
         GeneratorInput::Arg(arg) => {
             let response = generator
                 .bind(py)
-                .getattr(intern!(py, "send"))?
-                .call1((&arg,));
+                .call_method1(intern!(py, "send"), (&arg,));
             (response, None)
         }
         GeneratorInput::Err(err) => {
@@ -329,8 +328,7 @@ pub(crate) fn generator_send(
         GeneratorInput::Initial => {
             let response = generator
                 .bind(py)
-                .getattr(intern!(py, "send"))?
-                .call1((&py.None(),));
+                .call_method1(intern!(py, "send"), (py.None(),));
             (response, None)
         }
     };

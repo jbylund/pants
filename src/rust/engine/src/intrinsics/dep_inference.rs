@@ -278,9 +278,10 @@ fn convert_results_to_tuple<T, F>(
 where
     F: Fn(Python<'_>, &Path, T) -> Result<Value, PyErr>,
 {
-    let mut result_pairs = Vec::with_capacity(parsed_results.len());
-    for (path, result) in parsed_results {
-        let py_result_pair = Python::attach(|py| -> Result<_, PyErr> {
+    // One attach for all files: each attach may be a GIL handoff.
+    Python::attach(|py| -> Result<Value, PyErr> {
+        let mut result_pairs = Vec::with_capacity(parsed_results.len());
+        for (path, result) in parsed_results {
             let path_str: String = path
                 .as_os_str()
                 .to_str()
@@ -291,18 +292,17 @@ where
                         path.display()
                     ))
                 })?;
-            externs::store_tuple(
+            result_pairs.push(externs::store_tuple(
                 py,
                 vec![
                     path_str.into_pyobject(py)?.into_any().into(),
                     result_converter(py, &path, result)?,
                 ],
-            )
-        })?;
-        result_pairs.push(py_result_pair);
-    }
-
-    Python::attach(|py| externs::store_tuple(py, result_pairs)).map_err(Failure::from)
+            )?);
+        }
+        externs::store_tuple(py, result_pairs)
+    })
+    .map_err(Failure::from)
 }
 
 pub(crate) async fn get_or_create_inferred_dependencies<T, F>(
