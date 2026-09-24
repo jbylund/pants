@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
@@ -16,17 +17,21 @@ from pants.backend.python.dependency_inference.default_unowned_dependencies impo
 )
 from pants.backend.python.dependency_inference.module_mapper import (
     AllPythonTargets,
+    FirstPartyPythonModuleMapping,
     PythonModuleOwners,
     PythonModuleOwnersRequest,
     ResolveName,
+    ThirdPartyPythonModuleMapping,
     map_module_to_address,
     module_from_stripped_path,
+    module_owners,
 )
 from pants.backend.python.dependency_inference.parse_python_dependencies import (
     ParsedPythonAssetPaths,
     ParsedPythonImports,
     ParsePythonDependenciesRequest,
     PythonFileDependencies,
+    convert_native_python_dependencies,
 )
 from pants.backend.python.dependency_inference.parse_python_dependencies import (
     parse_python_dependencies as parse_python_dependencies_get,
@@ -56,6 +61,7 @@ from pants.core.util_rules.unowned_dependency_behavior import (
     UnownedDependencyUsage,
 )
 from pants.engine.addresses import Address, Addresses
+from pants.engine.fs import PathGlobs, RemovePrefix
 from pants.engine.internals.build_files import DELETED_ADDRESS
 from pants.engine.internals.graph import (
     OwnersRequest,
@@ -63,6 +69,8 @@ from pants.engine.internals.graph import (
     find_owners,
     resolve_targets,
 )
+from pants.engine.internals.native_engine import NativeDependenciesRequest
+from pants.engine.intrinsics import digest_to_snapshot, parse_python_deps, remove_prefix
 from pants.engine.rules import concurrently, implicitly, rule
 from pants.engine.target import (
     DependenciesRequest,
@@ -417,6 +425,79 @@ async def python_source_owners_by_file(
 
 
 @dataclass(frozen=True)
+class DirectoryPythonDependenciesRequest:
+    directory: str
+
+
+@dataclass(frozen=True)
+class DirectoryPythonDependencies:
+    """The parsed dependencies of the Python files directly in a directory, keyed by file path.
+
+    Files which could not be handled together with the rest of their directory are absent, and are
+    parsed individually instead.
+    """
+
+    by_file: FrozenDict[str, PythonFileDependencies]
+
+
+@rule
+async def parse_directory_python_dependencies(
+    request: DirectoryPythonDependenciesRequest, python_infer_subsystem: PythonInferSubsystem
+) -> DirectoryPythonDependencies:
+    empty = DirectoryPythonDependencies(FrozenDict())
+    prefix = f"{request.directory}/" if request.directory else ""
+    snapshot = await digest_to_snapshot(
+        **implicitly(PathGlobs([f"{prefix}*.py", f"{prefix}*.pyi"]))
+    )
+    if not snapshot.files:
+        return empty
+    source_roots_result = await get_optional_source_roots(
+        SourceRootsRequest.for_files(snapshot.files)
+    )
+    source_roots = {
+        optional_root.source_root
+        for optional_root in source_roots_result.path_to_optional_root.values()
+    }
+    if len(source_roots) != 1:
+        return empty
+    (source_root,) = source_roots
+    if source_root is None:
+        return empty
+    stripped_digest = (
+        snapshot.digest
+        if source_root.path == "."
+        else await remove_prefix(RemovePrefix(snapshot.digest, source_root.path))
+    )
+    try:
+        native_results = await parse_python_deps(NativeDependenciesRequest(stripped_digest))
+    except Exception:
+        return empty
+    return DirectoryPythonDependencies(
+        FrozenDict(
+            (
+                path if source_root.path == "." else os.path.join(source_root.path, path),
+                convert_native_python_dependencies(native_result, python_infer_subsystem),
+            )
+            for path, native_result in native_results.path_to_deps.items()
+        )
+    )
+
+
+async def _parse_deps(
+    field_set: PythonImportDependenciesInferenceFieldSet,
+    python_setup: PythonSetup,
+) -> PythonFileDependencies:
+    file_path = field_set.source.file_path
+    directory_dependencies = await parse_directory_python_dependencies(
+        DirectoryPythonDependenciesRequest(os.path.dirname(file_path)), **implicitly()
+    )
+    parsed = directory_dependencies.by_file.get(file_path)
+    if parsed is not None:
+        return parsed
+    return await _exec_parse_deps(field_set, python_setup)
+
+
+@dataclass(frozen=True)
 class ResolvedParsedPythonDependenciesRequest:
     field_set: PythonImportDependenciesInferenceFieldSet
     parsed_dependencies: PythonFileDependencies
@@ -434,6 +515,8 @@ class ResolvedParsedPythonDependencies:
 async def resolve_parsed_dependencies(
     request: ResolvedParsedPythonDependenciesRequest,
     python_infer_subsystem: PythonInferSubsystem,
+    first_party_mapping: FirstPartyPythonModuleMapping,
+    third_party_mapping: ThirdPartyPythonModuleMapping,
 ) -> ResolvedParsedPythonDependencies:
     """Find the owning targets for the parsed dependencies."""
 
@@ -457,13 +540,14 @@ async def resolve_parsed_dependencies(
         locality = source_root.path
 
     if parsed_imports:
-        owners_per_import = await concurrently(
-            map_module_to_address(
+        owners_per_import = [
+            module_owners(
                 PythonModuleOwnersRequest(imported_module, request.resolve, locality),
-                **implicitly(),
+                first_party_mapping,
+                third_party_mapping,
             )
             for imported_module in parsed_imports
-        )
+        ]
         resolve_results = _get_imports_info(
             address=request.field_set.address,
             owners_per_import=owners_per_import,
@@ -501,7 +585,7 @@ async def infer_python_dependencies_via_source(
     if not python_infer_subsystem.imports and not python_infer_subsystem.assets:
         return InferredDependencies([])
 
-    parsed_dependencies = await _exec_parse_deps(request.field_set, python_setup)
+    parsed_dependencies = await _parse_deps(request.field_set, python_setup)
 
     resolve = request.field_set.resolve.normalized_value(python_setup)
 
@@ -667,6 +751,7 @@ async def infer_python_conftest_dependencies(
 def import_rules():
     return [
         resolve_parsed_dependencies,
+        parse_directory_python_dependencies,
         find_other_owners_for_unowned_import,
         infer_python_dependencies_via_source,
         *pex.rules(),
