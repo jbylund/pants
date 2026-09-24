@@ -70,6 +70,23 @@ def test_source_root_at_buildroot() -> None:
         find_root("../foo/bar.py")
 
 
+@pytest.mark.parametrize(
+    "root,file_path,expected",
+    [
+        (".", "foo/bar.py", "foo/bar.py"),
+        ("src/python", "src/python/foo/bar.py", "foo/bar.py"),
+        ("src/python/project", "src/python/project/app.py", "app.py"),
+    ],
+)
+def test_source_root_strip(root: str, file_path: str, expected: str) -> None:
+    assert SourceRoot(root).strip(file_path) == expected
+
+
+def test_source_root_strip_rejects_file_outside_root() -> None:
+    with pytest.raises(ValueError, match="src/python is not a directory containing"):
+        SourceRoot("src/python").strip("src/pythonic/foo.py")
+
+
 def test_fixed_source_roots() -> None:
     def find_root(path):
         return _find_root(path, ("/root1", "/foo/root2", "/root1/root3"))
