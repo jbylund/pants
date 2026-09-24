@@ -59,6 +59,7 @@ from pants.testutil.option_util import create_options_bootstrapper
 from pants.util.collections import assert_single_element
 from pants.util.contextutil import pushd, temporary_dir, temporary_file
 from pants.util.dirutil import recursive_dirname, safe_mkdir, safe_mkdtemp, safe_open
+from pants.util.lmdb_semaphores import release_lmdb_semaphores
 from pants.util.logging import LogLevel
 from pants.util.ordered_set import OrderedSet
 from pants.util.strutil import softwrap
@@ -344,6 +345,10 @@ class RuleRunner:
                 store_dir = str(lmdb_store_dir)
             else:
                 store_dir = safe_mkdtemp(prefix="lmdb_store.")
+                # The store stays open until this process exits, after its directory is deleted
+                # (registered before this, so run after this): release its semaphores first, or
+                # on macOS they leak until reboot.
+                atexit.register(release_lmdb_semaphores, store_dir, include_open=True)
             local_store_options = dataclasses.replace(local_store_options, store_dir=store_dir)
 
         local_execution_root_dir = global_options.local_execution_root_dir
