@@ -304,6 +304,7 @@ impl PyExecutionStrategyOptions {
         child_default_memory: usize,
         child_max_memory: usize,
         graceful_shutdown_timeout: usize,
+        python_concurrency: usize,
     ) -> Self {
         Self(ExecutionStrategyOptions {
             local_parallelism,
@@ -318,6 +319,7 @@ impl PyExecutionStrategyOptions {
             graceful_shutdown_timeout: Duration::from_secs(
                 graceful_shutdown_timeout.try_into().unwrap(),
             ),
+            python_concurrency,
         })
     }
 }
