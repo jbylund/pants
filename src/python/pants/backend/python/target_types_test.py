@@ -164,6 +164,20 @@ def test_resolve_pex_binary_entry_point() -> None:
         assert_resolved(entry_point="*.py", expected=EntryPoint("doesnt matter"), is_file=True)
 
 
+def test_resolve_pex_binary_entry_point_under_repo_root_source_root() -> None:
+    rule_runner = RuleRunner(
+        rules=[
+            resolve_pex_entry_point,
+            QueryRule(ResolvedPexEntryPoint, [ResolvePexEntryPointRequest]),
+        ]
+    )
+    rule_runner.set_options(["--source-root-patterns=['/']"])
+    rule_runner.write_files({"project/app.py": ""})
+    ep_field = PexEntryPointField("app.py", Address("project"))
+    result = rule_runner.request(ResolvedPexEntryPoint, [ResolvePexEntryPointRequest(ep_field)])
+    assert result.val == EntryPoint(module="project.app")
+
+
 def _python_dependency_validation_rule_runner(*, options: Iterable[str] = ()) -> RuleRunner:
     rule_runner = RuleRunner(
         rules=[
