@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import functools
 import inspect
 import itertools
 import logging
@@ -32,7 +33,6 @@ from pants.engine.target import Field, ImmutableValue, RegisteredTargetTypes
 from pants.engine.unions import UnionMembership
 from pants.util.docutil import doc_url
 from pants.util.frozendict import FrozenDict
-from pants.util.memo import memoized_property
 from pants.util.strutil import docstring, softwrap, strval
 
 logger = logging.getLogger(__name__)
@@ -56,7 +56,7 @@ class BuildFileSymbolsInfo:
                 )
         return cls(info=FrozenDict(info))
 
-    @memoized_property
+    @functools.cached_property
     def symbols(self) -> FrozenDict[str, Any]:
         return FrozenDict({name: symbol.value for name, symbol in self.info.items()})
 

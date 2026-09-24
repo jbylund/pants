@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import functools
 import os.path
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -25,7 +26,6 @@ from pants.engine.internals.target_adaptor import TargetAdaptor
 from pants.engine.target import RegisteredTargetTypes, Tags, Target
 from pants.util.filtering import TargetFilter, and_filters, create_filters
 from pants.util.frozendict import FrozenDict
-from pants.util.memo import memoized_property
 
 
 class DuplicateNameError(MappingError):
@@ -172,14 +172,16 @@ class AddressFamily:
             dependencies_rules=dependencies_rules,
         )
 
-    @memoized_property
+    # NB: `cached_property` rather than `memoized_property`: these are read once per target, and
+    # an instance attribute is much cheaper to read than a memoized call.
+    @functools.cached_property
     def addresses_to_target_adaptors(self) -> Mapping[Address, TargetAdaptor]:
         return {
             Address(spec_path=self.namespace, target_name=name): target_adaptor
             for name, (_, target_adaptor) in self.name_to_target_adaptors.items()
         }
 
-    @memoized_property
+    @functools.cached_property
     def build_file_addresses(self) -> tuple[BuildFileAddress, ...]:
         return tuple(
             BuildFileAddress(
