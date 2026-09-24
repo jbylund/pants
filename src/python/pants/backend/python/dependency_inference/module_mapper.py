@@ -461,6 +461,42 @@ async def map_module_to_address(
     first_party_mapping: FirstPartyPythonModuleMapping,
     third_party_mapping: ThirdPartyPythonModuleMapping,
 ) -> PythonModuleOwners:
+    return module_owners(request, first_party_mapping, third_party_mapping)
+
+
+_module_owners_cache: (
+    tuple[
+        FirstPartyPythonModuleMapping,
+        ThirdPartyPythonModuleMapping,
+        dict[PythonModuleOwnersRequest, PythonModuleOwners],
+    ]
+    | None
+) = None
+
+
+def module_owners(
+    request: PythonModuleOwnersRequest,
+    first_party_mapping: FirstPartyPythonModuleMapping,
+    third_party_mapping: ThirdPartyPythonModuleMapping,
+) -> PythonModuleOwners:
+    """The owners of a module given the module mappings, cached for the latest pair of mappings."""
+    global _module_owners_cache
+    cache = _module_owners_cache
+    if cache is None or cache[0] is not first_party_mapping or cache[1] is not third_party_mapping:
+        cache = (first_party_mapping, third_party_mapping, {})
+        _module_owners_cache = cache
+    owners = cache[2].get(request)
+    if owners is None:
+        owners = _compute_module_owners(request, first_party_mapping, third_party_mapping)
+        cache[2][request] = owners
+    return owners
+
+
+def _compute_module_owners(
+    request: PythonModuleOwnersRequest,
+    first_party_mapping: FirstPartyPythonModuleMapping,
+    third_party_mapping: ThirdPartyPythonModuleMapping,
+) -> PythonModuleOwners:
     possible_providers: tuple[PossibleModuleProvider, ...] = (
         *third_party_mapping.providers_for_module(request.module, resolve=request.resolve),
         *first_party_mapping.providers_for_module(request.module, resolve=request.resolve),
