@@ -4,6 +4,7 @@
 use std::borrow::Borrow;
 use std::convert::Infallible;
 use std::ops::Deref;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::{fmt, hash};
 
@@ -157,15 +158,29 @@ impl TypeId {
     }
 
     pub fn union_in_scope_types(&self) -> Option<Vec<TypeId>> {
+        // Fixed when a union is declared, but consulted for every call of a polymorphic rule: cached
+        // (by a `PinnedTypeId`, which keeps the union alive, and with it its in-scope types) to avoid
+        // attaching to Python for each call.
+        static CACHE: std::sync::LazyLock<
+            parking_lot::RwLock<HashMap<PinnedTypeId, Option<Vec<TypeId>>>>,
+        > = std::sync::LazyLock::new(Default::default);
+        if let Some(in_scope_types) = CACHE.read().get(self) {
+            return in_scope_types.clone();
+        }
         Python::attach(|py| {
-            externs::union_in_scope_types(py, &self.as_py_type(py))
+            let py_type = self.as_py_type(py);
+            let in_scope_types = externs::union_in_scope_types(py, &py_type)
                 .unwrap()
                 .map(|types| {
                     types
                         .into_iter()
                         .map(|t| TypeId::new(&t.as_borrowed()))
-                        .collect()
-                })
+                        .collect::<Vec<_>>()
+                });
+            CACHE
+                .write()
+                .insert(PinnedTypeId::new(&py_type), in_scope_types.clone());
+            in_scope_types
         })
     }
 }
