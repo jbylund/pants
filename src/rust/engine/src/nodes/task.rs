@@ -113,7 +113,7 @@ impl Task {
             // `All` on a tokio `LocalSet`.
             in_workunit!("generator", Level::Trace, |workunit| async move {
                 let (value, _type_id) =
-                    Self::generate(context, workunit, params, entry, generator).await?;
+                    Self::generate(context, workunit, params, entry, generator, None).await?;
                 Ok(value)
             })
             .await
@@ -194,13 +194,22 @@ impl Task {
         params: Params,
         entry: Intern<rule_graph::Entry<Rule>>,
         generator: Value,
+        first_response: Option<GeneratorResponse>,
     ) -> NodeResult<(Value, TypeId)> {
+        // A response already obtained (from the attach that created the coroutine, or that sent it
+        // its last input), to handle before sending again.
+        let mut first_response = first_response;
         let mut input = GeneratorInput::Initial;
         loop {
-            let response = attach_gated(&context.core, |py| {
-                externs::generator_send(py, &generator, input)
-            })
-            .await?;
+            let response = match first_response.take() {
+                Some(response) => response,
+                None => {
+                    attach_gated(&context.core, |py| {
+                        externs::generator_send(py, &generator, input)
+                    })
+                    .await?
+                }
+            };
             match response {
                 GeneratorResponse::NativeCall(call) => {
                     let _blocking_token = workunit.blocking();
@@ -232,13 +241,18 @@ impl Task {
                     let _blocking_token = workunit.blocking();
                     match Self::gen_all(context, params.clone(), entry, items).await {
                         Ok(values) => {
-                            let values_tuple_result =
-                                attach_gated(&context.core, |py| externs::store_tuple(py, values))
-                                    .await;
-                            input = match values_tuple_result {
-                                Ok(t) => GeneratorInput::Arg(t),
-                                Err(err) => GeneratorInput::Err(err),
-                            }
+                            // Tuple the values and send them in one gated attach.
+                            first_response = Some(
+                                attach_gated(&context.core, |py| {
+                                    let input = match externs::store_tuple(py, values) {
+                                        Ok(t) => GeneratorInput::Arg(t),
+                                        Err(err) => GeneratorInput::Err(err),
+                                    };
+                                    externs::generator_send(py, &generator, input)
+                                })
+                                .await?,
+                            );
+                            input = GeneratorInput::Initial;
                         }
                         Err(throw @ Failure::Throw { .. }) => {
                             input = GeneratorInput::Err(PyErr::from(throw));
@@ -288,8 +302,9 @@ impl Task {
 
         let args = self.args;
         let core = context.core.clone();
+        let coroutine_type = context.core.types.coroutine;
 
-        let (mut result_val, mut result_type) = task_context(
+        let (mut result_val, mut result_type, first_response) = task_context(
             context.clone(),
             self.task.side_effecting,
             &self.side_effected,
@@ -322,12 +337,16 @@ impl Task {
                         func.call1(args_tuple)
                     };
 
-                    res.map(|res| {
-                        let type_id = TypeId::new(&res.get_type().as_borrowed());
-                        let val = Value::from(&res);
-                        (val, type_id)
-                    })
-                    .map_err(Failure::from)
+                    let res = res.map_err(Failure::from)?;
+                    let type_id = TypeId::new(&res.get_type().as_borrowed());
+                    let val = Value::from(&res);
+                    // Start a coroutine in the same attach as the call that created it.
+                    let first_response = if type_id == coroutine_type {
+                        Some(externs::generator_send(py, &val, GeneratorInput::Initial)?)
+                    } else {
+                        None
+                    };
+                    Ok::<_, Failure>((val, type_id, first_response))
                 })
                 .await
             },
@@ -339,7 +358,7 @@ impl Task {
                 context.clone(),
                 self.task.side_effecting,
                 &self.side_effected,
-                Self::generate(&context, workunit, params, self.entry, result_val),
+                Self::generate(&context, workunit, params, self.entry, result_val, first_response),
             )
             .await?;
             result_val = new_val;
