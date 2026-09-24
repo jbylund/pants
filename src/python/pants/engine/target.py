@@ -134,9 +134,19 @@ class FieldDefaults:
 
     _factories: FrozenDict[type[Field], FieldDefaultFactory]
 
-    @memoized_method
     def factory(self, field_type: type[Field]) -> FieldDefaultFactory:
         """Looks up a Field default factory in a subclass-aware way."""
+        # A per-instance dict rather than `memoized_method`: this is called for many fields of
+        # every target, where a memoized call costs much more than the dict lookup.
+        cache: dict[type[Field], FieldDefaultFactory] | None = self.__dict__.get("_factory_cache")
+        if cache is None:
+            cache = self.__dict__.setdefault("_factory_cache", {})
+        factory = cache.get(field_type)
+        if factory is None:
+            factory = cache.setdefault(field_type, self._find_factory(field_type))
+        return factory
+
+    def _find_factory(self, field_type: type[Field]) -> FieldDefaultFactory:
         factory = self._factories.get(field_type, None)
         if factory is not None:
             return factory
@@ -875,14 +885,25 @@ def _generate_file_level_targets(
 # -----------------------------------------------------------------------------------------------
 # FieldSet
 # -----------------------------------------------------------------------------------------------
+# For each FieldSet type, its dataclass field names, their Field types, and whether each is required.
+_FIELD_SET_FIELDS: dict[type[FieldSet], tuple[tuple[str, type[Field], bool], ...]] = {}
+
+
 def _get_field_set_fields_from_target(
     field_set: type[FieldSet], target: Target
 ) -> dict[str, Field]:
-    return {
-        dataclass_field_name: (
-            target[field_cls] if field_cls in field_set.required_fields else target.get(field_cls)
+    fields = _FIELD_SET_FIELDS.get(field_set)
+    if fields is None:
+        fields = _FIELD_SET_FIELDS.setdefault(
+            field_set,
+            tuple(
+                (name, field_cls, field_cls in field_set.required_fields)
+                for name, field_cls in field_set.fields.items()
+            ),
         )
-        for dataclass_field_name, field_cls in field_set.fields.items()
+    return {
+        name: (target[field_cls] if required else target.get(field_cls))
+        for name, field_cls, required in fields
     }
 
 
