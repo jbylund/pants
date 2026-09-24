@@ -355,10 +355,12 @@ async def parse_address_family(
     defaults = BuildFileDefaults({})
     dependents_rules: BuildFileDependencyRules | None = None
     dependencies_rules: BuildFileDependencyRules | None = None
-    parent_dirs = tuple(PurePath(directory.path).parents)
+    parent_dirs = tuple(str(parent_dir) for parent_dir in PurePath(directory.path).parents)
     if parent_dirs:
+        # NB: Implicit params, as other callers use, so that each directory is parsed once. (The
+        # root is `.` here rather than `""`: synthetic targets reserve `""` for all directories.)
         maybe_parents = await concurrently(
-            parse_address_family(AddressFamilyDir(str(parent_dir)), **implicitly())
+            parse_address_family(**implicitly(AddressFamilyDir(parent_dir)))
             for parent_dir in parent_dirs
         )
         for maybe_parent in maybe_parents:
@@ -613,7 +615,7 @@ async def _get_target_family_and_adaptor_for_dep_rules(
         )
     )
     maybe_address_families = await concurrently(
-        parse_address_family(AddressFamilyDir(rules_path), **implicitly())
+        parse_address_family(**implicitly(AddressFamilyDir(rules_path)))
         for rules_path in rules_paths
     )
     maybe_families = {maybe.path: maybe for maybe in maybe_address_families}

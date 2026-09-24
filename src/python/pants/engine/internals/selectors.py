@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import itertools
+import types
 from collections.abc import Coroutine, Iterable
 from dataclasses import dataclass
-from typing import Any, TypeVar, overload
+from typing import Any, TypeVar, cast, overload
 
 from pants.engine.internals.native_engine import Call as Call  # noqa: F401
 from pants.engine.internals.native_engine import _Concurrently
@@ -44,6 +45,13 @@ _Out6 = TypeVar("_Out6")
 _Out7 = TypeVar("_Out7")
 _Out8 = TypeVar("_Out8")
 _Out9 = TypeVar("_Out9")
+
+
+_ITERABLE_TYPES = (types.GeneratorType, list, tuple)
+
+
+async def _no_results() -> tuple[()]:
+    return ()
 
 
 @overload
@@ -209,7 +217,9 @@ def Concurrently(
     `await concurrently(...) for ... in ...)`.
     """
     if (
-        isinstance(__arg0, Iterable)
+        # NB: A cheap type check first: this is called for almost every rule, and the
+        # `Iterable` ABC check is comparatively slow.
+        (type(__arg0) in _ITERABLE_TYPES or isinstance(__arg0, Iterable))
         and __arg1 is None
         and __arg2 is None
         and __arg3 is None
@@ -221,7 +231,11 @@ def Concurrently(
         and __arg9 is None
         and not __args
     ):
-        return _Concurrently(tuple(__arg0))
+        items = tuple(cast(Iterable[Any], __arg0))
+        if not items:
+            # Nothing to wait for: complete without a round trip through the engine.
+            return cast(_Concurrently[tuple[_Output, ...]], _no_results())
+        return _Concurrently(items)
 
     if (
         isinstance(__arg0, (Coroutine, Call, _Concurrently))

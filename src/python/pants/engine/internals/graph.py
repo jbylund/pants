@@ -17,7 +17,7 @@ from typing import Any, DefaultDict, NamedTuple, Type, TypeVar, cast
 
 from pants.base.deprecated import warn_or_error
 from pants.base.specs import AncestorGlobSpec, RawSpecsWithoutFileOwners, RecursiveGlobSpec
-from pants.build_graph.address import BuildFileAddressRequest, ResolveError
+from pants.build_graph.address import BuildFileAddress, BuildFileAddressRequest, ResolveError
 from pants.engine.addresses import Address, Addresses, AddressInput, UnparsedAddressInputs
 from pants.engine.collection import Collection
 from pants.engine.environment import ChosenLocalEnvironmentName, EnvironmentName
@@ -1310,24 +1310,28 @@ async def find_owners(
             candidate_tgts = deleted_candidate_tgts
             sources_set = deleted_files
 
-        build_file_addresses = await concurrently(
-            find_build_file(
-                BuildFileAddressRequest(
-                    tgt.address, description_of_origin="<owners rule - cannot trigger>"
+        # The BUILD file of each candidate is only consulted when it may count as a source.
+        match_build_files = owners_request.match_if_owning_build_file_included_in_sources
+        build_file_addresses: Sequence[BuildFileAddress | None] = (
+            await concurrently(
+                find_build_file(
+                    BuildFileAddressRequest(
+                        tgt.address, description_of_origin="<owners rule - cannot trigger>"
+                    )
                 )
+                for tgt in candidate_tgts
             )
-            for tgt in candidate_tgts
+            if match_build_files
+            else [None] * len(candidate_tgts)
         )
 
+        sources_list = list(sources_set)
         for candidate_tgt, bfa in zip(candidate_tgts, build_file_addresses):
             matching_files = set(
-                candidate_tgt.get(SourcesField).filespec_matcher.matches(list(sources_set))
+                candidate_tgt.get(SourcesField).filespec_matcher.matches(sources_list)
             )
 
-            if not matching_files and not (
-                owners_request.match_if_owning_build_file_included_in_sources
-                and bfa.rel_path in sources_set
-            ):
+            if not matching_files and not (bfa is not None and bfa.rel_path in sources_set):
                 continue
 
             # If we have block-level change information (`sources_blocks`) for this BUILD file,
@@ -1335,6 +1339,7 @@ async def find_owners(
             # by the line changes are already captured by the `block_owners` calculation.
             if (
                 not matching_files
+                and bfa is not None
                 and target_origin_sources_blocks_options.enable
                 and bfa.rel_path in owners_request.sources_blocks
             ):
@@ -1616,16 +1621,28 @@ async def determine_explicitly_provided_dependencies(
         else:
             addresses.append(result)
 
-    parsed_includes = await concurrently(
-        resolve_address(**implicitly({ai: AddressInput})) for ai in addresses
+    resolved = await concurrently(
+        resolve_address(**implicitly({ai: AddressInput}))
+        for ai in itertools.chain(addresses, ignored_addresses)
     )
-    parsed_ignores = await concurrently(
-        resolve_address(**implicitly({ai: AddressInput})) for ai in ignored_addresses
-    )
+    parsed_includes = resolved[: len(addresses)]
+    parsed_ignores = resolved[len(addresses) :]
     return ExplicitlyProvidedDependencies(
         request.field.address,
         FrozenOrderedSet(sorted(parsed_includes)),
         FrozenOrderedSet(sorted(parsed_ignores)),
+    )
+
+
+async def explicitly_provided_dependencies(field: Dependencies) -> ExplicitlyProvidedDependencies:
+    """The `ExplicitlyProvidedDependencies` of the field, computed without any engine calls for a
+    field without values (as most are)."""
+    if not field.value:
+        return ExplicitlyProvidedDependencies(field.address, FrozenOrderedSet(), FrozenOrderedSet())
+    # NB: With the default predicate (which explicit dependencies don't consult), as dependency
+    # inference requests them, so that each target's are computed once.
+    return await determine_explicitly_provided_dependencies(
+        **implicitly(DependenciesRequest(field))
     )
 
 
@@ -1701,9 +1718,7 @@ async def resolve_dependencies(
         return Addresses([])
 
     try:
-        explicitly_provided = await determine_explicitly_provided_dependencies(
-            **implicitly(request)
-        )
+        explicitly_provided = await explicitly_provided_dependencies(request.field)
     except Exception as e:
         raise InvalidFieldException(
             f"{tgt.description_of_origin}: Failed to get dependencies for {tgt.address}: {e}"
