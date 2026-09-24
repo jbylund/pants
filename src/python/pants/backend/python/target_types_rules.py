@@ -219,8 +219,7 @@ async def resolve_pex_entry_point(request: ResolvePexEntryPointRequest) -> Resol
         )
     entry_point_path = entry_point_paths.files[0]
     source_root = await get_source_root(SourceRootRequest.for_file(entry_point_path))
-    stripped_source_path = os.path.relpath(entry_point_path, source_root.path)
-    module_base, _ = os.path.splitext(stripped_source_path)
+    module_base, _ = os.path.splitext(source_root.strip(entry_point_path))
     normalized_path = module_base.replace(os.path.sep, ".")
     return ResolvedPexEntryPoint(
         dataclasses.replace(ep_val, module=normalized_path), file_name_used=True
