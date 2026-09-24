@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 import itertools
 import logging
 import os
@@ -67,6 +68,7 @@ class NoSourceRootError(SourceRootError):
 
 # We perform pattern matching against absolute paths, where "/" represents the repo root.
 _repo_root = PurePath(os.path.sep)
+_GLOB_CHARS = frozenset("*?[")
 
 
 @dataclass(frozen=True)
@@ -80,18 +82,40 @@ class SourceRootPatternMatcher:
                     f"`..` disallowed in source root pattern: {root_pattern}."
                 )
 
+    @functools.cached_property
+    def _literal_patterns(
+        self,
+    ) -> tuple[frozenset[tuple[str, ...]], frozenset[tuple[str, ...]], list[int], tuple[str, ...]]:
+        """Patterns without wildcards, by their parts: absolute patterns (which must match the whole
+        path), relative ones (which match its trailing parts), the lengths of the latter, and the
+        remaining patterns."""
+        literal = [p for p in self.root_patterns if not _GLOB_CHARS.intersection(p)]
+        anchored = frozenset(PurePath(p).parts for p in literal if PurePath(p).is_absolute())
+        suffixes = frozenset(PurePath(p).parts for p in literal if not PurePath(p).is_absolute())
+        return (
+            anchored,
+            suffixes,
+            sorted({len(parts) for parts in suffixes}),
+            tuple(p for p in self.root_patterns if p not in literal),
+        )
+
     def get_patterns(self) -> tuple[str, ...]:
         return tuple(self.root_patterns)
 
     def matches_root_patterns(self, relpath: PurePath) -> bool:
         """Does this putative root match a pattern?"""
-        # Note: This is currently O(n) where n is the number of patterns, which
-        # we expect to be small.  We can optimize if it becomes necessary.
         putative_root = _repo_root / relpath
-        for pattern in self.root_patterns:
-            if putative_root.match(pattern):
+        # Literal patterns are matched by their parts, as `PurePath.match` matches them but much
+        # more cheaply; the rest with `PurePath.match`.
+        anchored, suffixes, suffix_lengths, glob_patterns = self._literal_patterns
+        parts = putative_root.parts
+        if parts in anchored:
+            return True
+        for length in suffix_lengths:
+            # NB: A relative pattern never matches the (absolute) anchor itself.
+            if length < len(parts) and parts[-length:] in suffixes:
                 return True
-        return False
+        return any(putative_root.match(p) for p in glob_patterns)
 
 
 class SourceRootConfig(Subsystem):

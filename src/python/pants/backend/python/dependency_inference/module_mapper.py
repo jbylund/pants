@@ -9,11 +9,11 @@ import itertools
 import logging
 import os
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import total_ordering
 from pathlib import PurePath
-from typing import DefaultDict
+from typing import DefaultDict, cast
 
 from packaging.utils import canonicalize_name as canonicalize_project_name
 
@@ -32,12 +32,18 @@ from pants.backend.python.target_types import (
     PythonResolveField,
     PythonSourceField,
 )
-from pants.core.util_rules.stripped_source_files import StrippedFileNameRequest, strip_file_name
+from pants.core.util_rules.stripped_source_files import (
+    StrippedFileName,
+    StrippedFileNameRequest,
+    strip_file_name,
+)
 from pants.engine.addresses import Address
 from pants.engine.environment import EnvironmentName
 from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import AllTargets, Target
 from pants.engine.unions import UnionMembership, UnionRule, union
+from pants.source.source_root import SourceRoot, SourceRootsRequest, get_optional_source_roots
+from pants.util.dirutil import fast_relpath
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
 from pants.util.strutil import softwrap
@@ -250,10 +256,24 @@ async def map_first_party_python_targets_to_modules(
     all_python_targets: AllPythonTargets,
     python_setup: PythonSetup,
 ) -> FirstPartyPythonMappingImpl:
-    stripped_file_per_target = await concurrently(
-        strip_file_name(StrippedFileNameRequest(tgt[PythonSourceField].file_path))
-        for tgt in all_python_targets.first_party
-    )
+    file_paths = [tgt[PythonSourceField].file_path for tgt in all_python_targets.first_party]
+    # Source roots are found per directory in one request, rather than a request per file.
+    source_roots = await get_optional_source_roots(SourceRootsRequest.for_files(file_paths))
+    optional_roots = [
+        source_roots.path_to_optional_root[PurePath(file_path)].source_root
+        for file_path in file_paths
+    ]
+    stripped_file_per_target: Sequence[StrippedFileName]
+    if all(root is not None for root in optional_roots):
+        stripped_file_per_target = [
+            StrippedFileName(file_path if root.path == "." else fast_relpath(file_path, root.path))
+            for file_path, root in zip(file_paths, cast(list[SourceRoot], optional_roots))
+        ]
+    else:
+        # Reports the file without a source root.
+        stripped_file_per_target = await concurrently(
+            strip_file_name(StrippedFileNameRequest(file_path)) for file_path in file_paths
+        )
 
     resolves_to_modules_to_providers: DefaultDict[
         ResolveName, DefaultDict[str, list[ModuleProvider]]
