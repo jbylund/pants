@@ -116,6 +116,40 @@ async def get_scripts_digest(scripts_package: str, filenames: Iterable[str]) -> 
     return digest
 
 
+def convert_native_python_dependencies(
+    native_result, python_infer_subsystem: PythonInferSubsystem
+) -> PythonFileDependencies:
+    imports = dict(native_result.imports)
+    assets = set()
+
+    if python_infer_subsystem.string_imports or python_infer_subsystem.assets:
+        for string, line in native_result.string_candidates.items():
+            if (
+                python_infer_subsystem.string_imports
+                and not _is_ignored_string_import(
+                    string, python_infer_subsystem.string_import_ignore
+                )
+                and string.count(".") >= python_infer_subsystem.string_imports_min_dots
+                and all(part.isidentifier() for part in string.split("."))
+            ):
+                imports.setdefault(string, (line, True))
+            if (
+                python_infer_subsystem.assets
+                and string.count("/") >= python_infer_subsystem.assets_min_slashes
+            ):
+                assets.add(string)
+
+    explicit_deps = dict(native_result.explicit_dependencies)
+
+    return PythonFileDependencies(
+        ParsedPythonImports(
+            (key, ParsedPythonImportInfo(*value)) for key, value in imports.items()
+        ),
+        ParsedPythonAssetPaths(sorted(assets)),
+        ExplicitPythonDependencies(FrozenDict(explicit_deps)),
+    )
+
+
 @rule(level=LogLevel.DEBUG)
 async def parse_python_dependencies(
     request: ParsePythonDependenciesRequest,
@@ -126,38 +160,12 @@ async def parse_python_dependencies(
         NativeDependenciesRequest(stripped_sources.snapshot.digest)
     )
 
-    path_to_deps = {}
-    for path, native_result in native_results.path_to_deps.items():
-        imports = dict(native_result.imports)
-        assets = set()
-
-        if python_infer_subsystem.string_imports or python_infer_subsystem.assets:
-            for string, line in native_result.string_candidates.items():
-                if (
-                    python_infer_subsystem.string_imports
-                    and not _is_ignored_string_import(
-                        string, python_infer_subsystem.string_import_ignore
-                    )
-                    and string.count(".") >= python_infer_subsystem.string_imports_min_dots
-                    and all(part.isidentifier() for part in string.split("."))
-                ):
-                    imports.setdefault(string, (line, True))
-                if (
-                    python_infer_subsystem.assets
-                    and string.count("/") >= python_infer_subsystem.assets_min_slashes
-                ):
-                    assets.add(string)
-
-        explicit_deps = dict(native_result.explicit_dependencies)
-
-        path_to_deps[path] = PythonFileDependencies(
-            ParsedPythonImports(
-                (key, ParsedPythonImportInfo(*value)) for key, value in imports.items()
-            ),
-            ParsedPythonAssetPaths(sorted(assets)),
-            ExplicitPythonDependencies(FrozenDict(explicit_deps)),
+    return PythonFilesDependencies(
+        FrozenDict(
+            (path, convert_native_python_dependencies(native_result, python_infer_subsystem))
+            for path, native_result in native_results.path_to_deps.items()
         )
-    return PythonFilesDependencies(FrozenDict(path_to_deps))
+    )
 
 
 def rules():
