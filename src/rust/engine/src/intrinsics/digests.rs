@@ -26,7 +26,7 @@ use crate::nodes::{
     task_get_context, unmatched_globs_additional_context,
 };
 use crate::python::{Key, Value, throw};
-use crate::{Context, Failure};
+use crate::Failure;
 
 pub fn register(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(add_prefix, m)?)?;
