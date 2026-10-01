@@ -14,6 +14,7 @@ from collections import defaultdict
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass
 from pathlib import PurePath
+from types import CodeType
 from typing import Any, cast
 
 import typing_extensions
@@ -122,6 +123,56 @@ def _parse_build_file_ast(content: str | bytes, filepath: str) -> ast.Module:
         return ast.parse(content, filepath)
     except SyntaxError as e:
         raise BuildFileSyntaxError.from_syntax_error(e).with_traceback(e.__traceback__)
+
+
+@dataclass(frozen=True)
+class _CompiledBuildFile:
+    """What a BUILD file's content alone determines: its syntax tree, its code, and the names of
+    the environment variables it reads."""
+
+    tree: ast.Module
+    code: CodeType
+    env_vars: tuple[str, ...]
+
+    def code_for(self, filepath: str) -> CodeType:
+        """The code, attributed to `filepath` (for tracebacks), which may differ from the path of
+        the file it was compiled for."""
+        return _with_filename(self.code, filepath)
+
+
+# Many BUILD files in a repo have identical content (e.g. a bare `python_sources()`), so each
+# distinct content is parsed and compiled once. Bounded, since under pantsd edits leave stale
+# entries behind.
+_COMPILED_BUILD_FILES: dict[bytes, _CompiledBuildFile] = {}
+_COMPILED_BUILD_FILES_MAX = 65536
+
+
+def _compile_build_file(content: bytes, filepath: str) -> _CompiledBuildFile:
+    compiled = _COMPILED_BUILD_FILES.get(content)
+    if compiled is None:
+        # Errors are raised for this file's path, and are not cached.
+        tree = _parse_build_file_ast(content, filepath)
+        compiled = _CompiledBuildFile(
+            tree=tree,
+            code=compile(tree, filepath, "exec", dont_inherit=True),
+            env_vars=tuple(BUILDFileEnvVarExtractor.get_env_vars_from_tree(tree, filepath)),
+        )
+        if len(_COMPILED_BUILD_FILES) >= _COMPILED_BUILD_FILES_MAX:
+            _COMPILED_BUILD_FILES.clear()
+        _COMPILED_BUILD_FILES[content] = compiled
+    return compiled
+
+
+def _with_filename(code: CodeType, filename: str) -> CodeType:
+    if code.co_filename == filename:
+        return code
+    return code.replace(
+        co_filename=filename,
+        co_consts=tuple(
+            _with_filename(const, filename) if isinstance(const, CodeType) else const
+            for const in code.co_consts
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -390,32 +441,30 @@ async def parse_address_family(
         dependents_rules_parser_state = None
         dependencies_rules_parser_state = None
 
-    parsed_build_files = [
-        (fc, _parse_build_file_ast(fc.content, fc.path)) for fc in digest_contents
+    compiled_build_files = [
+        (fc, _compile_build_file(fc.content, fc.path)) for fc in digest_contents
     ]
 
     def _extract_env_vars(
-        tree: ast.Module, filename: str, extra_env: Sequence[str], env: CompleteEnvironmentVars
+        env_var_names: Sequence[str], extra_env: Sequence[str], env: CompleteEnvironmentVars
     ) -> Coroutine[Any, Any, EnvironmentVars]:
         """For BUILD file env vars, we only ever consult the local systems env."""
-        env_vars = (*BUILDFileEnvVarExtractor.get_env_vars_from_tree(tree, filename), *extra_env)
-        return environment_vars_subset(EnvironmentVarsRequest(env_vars), env)
+        return environment_vars_subset(EnvironmentVarsRequest((*env_var_names, *extra_env)), env)
 
     all_env_vars = await concurrently(
         _extract_env_vars(
-            tree,
-            fc.path,
+            compiled.env_vars,
             prelude_symbols.referenced_env_vars,
             session_values[CompleteEnvironmentVars],
         )
-        for fc, tree in parsed_build_files
+        for _, compiled in compiled_build_files
     )
 
     declared_address_maps = [
         AddressMap.parse(
             fc.path,
             fc.content.decode(),
-            tree,
+            compiled.tree,
             parser,
             prelude_symbols,
             env_vars,
@@ -423,8 +472,9 @@ async def parse_address_family(
             defaults_parser_state,
             dependents_rules_parser_state,
             dependencies_rules_parser_state,
+            code=compiled.code_for(fc.path),
         )
-        for (fc, tree), env_vars in zip(parsed_build_files, all_env_vars)
+        for (fc, compiled), env_vars in zip(compiled_build_files, all_env_vars)
     ]
     declared_address_maps.sort(key=lambda x: x.path)
 
