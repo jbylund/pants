@@ -11,6 +11,7 @@ extern crate derivative;
 mod context;
 mod downloads;
 mod externs;
+mod gil_thread;
 mod interning;
 mod intrinsics;
 mod nodes;
