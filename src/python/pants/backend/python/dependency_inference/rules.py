@@ -18,17 +18,14 @@ from pants.backend.python.dependency_inference.default_unowned_dependencies impo
 )
 from pants.backend.python.dependency_inference.module_mapper import (
     AllPythonTargets,
-    FirstPartyPythonModuleMapping,
     PythonModuleOwners,
     PythonModuleOwnersLookup,
     PythonModuleOwnersRequest,
     ResolveName,
-    ThirdPartyPythonModuleMapping,
     map_module_to_address,
     map_third_party_modules_to_addresses,
     merge_first_party_module_mappings,
     module_from_stripped_path,
-    module_owners,
 )
 from pants.backend.python.dependency_inference.parse_python_dependencies import (
     ParsedPythonAssetPaths,
@@ -69,7 +66,7 @@ from pants.core.util_rules.unowned_dependency_behavior import (
     UnownedDependencyUsage,
 )
 from pants.engine.addresses import Address, Addresses
-from pants.engine.environment import ChosenLocalEnvironmentName, EnvironmentName
+from pants.engine.environment import ChosenLocalEnvironmentName
 from pants.engine.fs import PathGlobs, RemovePrefix
 from pants.engine.internals.build_files import DELETED_ADDRESS
 from pants.engine.internals.graph import (
@@ -89,15 +86,12 @@ from pants.engine.intrinsics import (
 from pants.engine.rules import concurrently, implicitly, rule
 from pants.engine.target import (
     BulkDependenciesRequest,
-    DependenciesRequest,
     ExplicitlyProvidedDependencies,
     ExplicitlyProvidedDependenciesRequest,
     FieldSet,
     InferDependenciesRequest,
     InferredDependencies,
-    SpecialCasedDependencies,
     Target,
-    ValidateDependenciesRequest,
     applicable_field_set_types,
 )
 from pants.engine.unions import UnionMembership, UnionRule
@@ -790,7 +784,7 @@ class PythonPeekBulkDependenciesRequest(PeekBulkDependenciesRequest):
         }
         inference_types = union_membership.get(InferDependenciesRequest)
         unhandled_field_set_types = tuple(
-            inference_type.infer_from
+            inference_type.infer_from  # type: ignore[misc]
             for inference_type in inference_types
             if inference_type not in handled_inference_types
         )

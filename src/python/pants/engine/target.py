@@ -892,7 +892,7 @@ _FS = TypeVar("_FS", bound="FieldSet")
 # Whether a FieldSet's required fields are registered on a target, which depends only on the target's
 # type and registered fields: keyed by (FieldSet type, Target type, registered Field types).
 _FIELD_SET_HAS_FIELDS: dict[tuple[type, type, tuple[type, ...]], bool] = {}
-_APPLICABLE_FIELD_SET_CANDIDATES: dict[tuple, tuple[tuple[type, bool], ...]] = {}
+_APPLICABLE_FIELD_SET_CANDIDATES: dict[tuple, tuple[tuple[type[FieldSet], bool], ...]] = {}
 
 
 def applicable_field_set_types(
@@ -904,7 +904,10 @@ def applicable_field_set_types(
     candidates = _APPLICABLE_FIELD_SET_CANDIDATES.get(key)
     if candidates is None:
         candidates = _APPLICABLE_FIELD_SET_CANDIDATES[key] = tuple(
-            (field_set_type, field_set_type.opt_out.__func__ is not FieldSet.opt_out.__func__)
+            (
+                field_set_type,
+                field_set_type.opt_out.__func__ is not FieldSet.opt_out.__func__,  # type: ignore[attr-defined]
+            )
             for field_set_type in field_set_types
             if tgt.has_fields(field_set_type.required_fields)
         )

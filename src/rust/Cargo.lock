@@ -1175,6 +1175,7 @@ dependencies = [
  "axum-server",
  "bytes",
  "cache",
+ "crossbeam-channel",
  "deepsize",
  "dep_inference",
  "derivative",
