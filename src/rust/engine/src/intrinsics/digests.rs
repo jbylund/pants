@@ -5,6 +5,7 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use futures::{StreamExt, TryStreamExt};
 use fs::{
     DigestTrie, DirectoryDigest, GlobMatching, PathGlobs, PathStat, RelativePath, SymlinkBehavior,
     TypedPath,
@@ -38,6 +39,7 @@ pub fn register(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(merge_digests, m)?)?;
     m.add_function(wrap_pyfunction!(path_globs_to_digest, m)?)?;
     m.add_function(wrap_pyfunction!(path_globs_to_paths, m)?)?;
+    m.add_function(wrap_pyfunction!(path_globs_to_snapshots, m)?)?;
     m.add_function(wrap_pyfunction!(remove_prefix, m)?)?;
     m.add_function(wrap_pyfunction!(path_metadata_request, m)?)?;
 
@@ -201,6 +203,41 @@ fn lift_python_path_globs(path_globs: Value) -> Result<PathGlobs, Failure> {
         Snapshot::lift_path_globs(py_path_globs)
     })
     .map_err(|e| throw(format!("Failed to parse PathGlobs: {e}")))
+}
+
+/// Snapshot each of a tuple of PathGlobs, converting all the results in one step.
+#[pyfunction]
+fn path_globs_to_snapshots(path_globs: Value) -> PyGeneratorResponseNativeCall {
+    PyGeneratorResponseNativeCall::new(async move {
+        let context = task_get_context();
+        let path_globs = Python::attach(|py| -> Result<Vec<PathGlobs>, Failure> {
+            externs::collect_iterable(path_globs.bind(py))
+                .map_err(|e| throw(format!("Failed to collect PathGlobs: {e}")))?
+                .iter()
+                .map(|item| {
+                    Snapshot::lift_path_globs(item)
+                        .map_err(|e| throw(format!("Failed to parse PathGlobs: {e}")))
+                })
+                .collect()
+        })?;
+        // Bounded like a `concurrently(..)` of individual requests.
+        let parallelism = std::cmp::max(64, context.core.local_parallelism * 4);
+        let snapshots: Vec<store::Snapshot> = futures::stream::iter(
+            path_globs
+                .into_iter()
+                .map(|path_globs| context.get(Snapshot::from_path_globs(path_globs))),
+        )
+        .buffered(parallelism)
+        .try_collect()
+        .await?;
+        Python::attach(|py| -> Result<Value, Failure> {
+            let values = snapshots
+                .into_iter()
+                .map(|snapshot| Snapshot::store_snapshot(py, snapshot))
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(externs::store_tuple(py, values)?)
+        })
+    })
 }
 
 #[pyfunction]
