@@ -105,6 +105,32 @@ pub(crate) async fn attach_gated<R>(core: &Core, f: impl FnOnce(Python<'_>) -> R
     result
 }
 
+pub(crate) fn try_task_context() -> Option<Arc<Context>> {
+    TASK_CONTEXT.try_with(Arc::clone).ok()
+}
+
+pub(crate) fn sync_task_context<R>(context: Arc<Context>, f: impl FnOnce() -> R) -> R {
+    TASK_CONTEXT.sync_scope(context, f)
+}
+
+pub(crate) fn task_is_side_effecting() -> bool {
+    TASK_SIDE_EFFECTED.try_with(|_| ()).is_ok()
+}
+
+/// Runs a rule's Python step: on the GIL thread if it is enabled, otherwise attached on this
+/// thread through the engine's Python gate (see `attach_gated`).
+pub(crate) async fn run_python<R, F>(core: &Core, f: F) -> R
+where
+    R: Send + 'static,
+    F: FnOnce(Python<'_>) -> R + Send + 'static,
+{
+    if crate::gil_thread::enabled() {
+        crate::gil_thread::run_py(f).await
+    } else {
+        attach_gated(core, f).await
+    }
+}
+
 pub fn task_get_context() -> Context {
     TASK_CONTEXT.with(|c| (**c).clone())
 }
