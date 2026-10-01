@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import sys
 from dataclasses import dataclass
@@ -291,6 +292,14 @@ class LocalPantsRunner:
             return PANTS_FAILED_EXIT_CODE
 
     def run(self, start_time: float) -> ExitCode:
+        if not self.is_pantsd_run:
+            # Without pantsd, the process exits (without finalizing the interpreter) right after
+            # this run, so cyclic garbage need not be collected: collection passes over the large
+            # heap of the build graph cost far more than the memory they would reclaim. Freeze the
+            # startup objects (options, rules, types) first, so they are never scanned again.
+            gc.freeze()
+            gc.disable()
+
         specs_strs = list(self.ng_invocation.specs()) if self.ng_invocation else self.options.specs
         self.run_tracker.start(run_start_time=start_time, specs=specs_strs)
         global_options = self.options.for_global_scope()
