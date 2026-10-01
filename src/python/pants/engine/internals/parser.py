@@ -16,6 +16,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import InitVar, dataclass, field
 from difflib import get_close_matches
 from pathlib import PurePath
+from types import CodeType
 from typing import Annotated, Any, TypeVar
 
 import typing_extensions
@@ -431,6 +432,7 @@ class Parser:
         defaults: BuildFileDefaultsParserState,
         dependents_rules: BuildFileDependencyRulesParserState | None,
         dependencies_rules: BuildFileDependencyRulesParserState | None,
+        code: CodeType | None = None,
     ) -> list[TargetAdaptor]:
         self._parse_state.reset(
             filepath=filepath,
@@ -450,7 +452,7 @@ class Parser:
             defined_symbols = set()
             while True:
                 try:
-                    code = compile(tree, filepath, "exec", dont_inherit=True)
+                    code = code or compile(tree, filepath, "exec", dont_inherit=True)
                     exec(code, global_symbols)
                 except NameError as e:
                     bad_symbol = _extract_symbol_from_name_error(e)
@@ -477,7 +479,7 @@ class Parser:
             return self._parse_state.parsed_targets()
 
         try:
-            code = compile(tree, filepath, "exec", dont_inherit=True)
+            code = code or compile(tree, filepath, "exec", dont_inherit=True)
             exec(code, global_symbols)
         except NameError as e:
             frame = traceback.extract_tb(e.__traceback__, limit=-1)[0]
