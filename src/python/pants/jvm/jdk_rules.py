@@ -19,7 +19,7 @@ from pants.core.util_rules.system_binaries import BashBinary, LnBinary
 from pants.engine.fs import CreateDigest, Digest, FileContent, MergeDigests
 from pants.engine.intrinsics import create_digest, execute_process, merge_digests
 from pants.engine.process import Process, ProcessCacheScope
-from pants.engine.rules import collect_rules, implicitly, rule
+from pants.engine.rules import concurrently, collect_rules, implicitly, rule
 from pants.engine.target import CoarsenedTarget
 from pants.jvm.compile import ClasspathEntry
 from pants.jvm.resolve.coordinate import Coordinates
@@ -203,14 +203,11 @@ async def prepare_jdk_environment(
     jvm: JvmSubsystem,
     jvm_env_aware: JvmSubsystem.EnvironmentAware,
     coursier: Coursier,
-    nailgun_: Nailgun,
     bash: BashBinary,
     ln: LnBinary,
     request: JdkRequest,
     env_target: EnvironmentTarget,
 ) -> JdkEnvironment:
-    nailgun = nailgun_.classpath_entry
-
     version = request.version
     if version == DefaultJdk.SOURCE_DEFAULT:
         version = jvm.jdk
@@ -252,7 +249,9 @@ async def prepare_jdk_environment(
         **coursier.env,
     }
 
-    java_version_result = await execute_process(
+    # The nailgun jar is only needed to assemble the environment: fetch it while the JDK downloads.
+    java_version_result, nailgun_ = await concurrently(
+        execute_process(
         Process(
             argv=(
                 bash.path,
@@ -267,7 +266,10 @@ async def prepare_jdk_environment(
             level=LogLevel.DEBUG,
         ),
         **implicitly(),
+        ),
+        fetch_nailgun(**implicitly()),
     )
+    nailgun = nailgun_.classpath_entry
 
     if java_version_result.exit_code != 0:
         raise ValueError(
