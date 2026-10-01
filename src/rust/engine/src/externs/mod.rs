@@ -286,6 +286,17 @@ pub(crate) enum GeneratorInput {
     Initial,
     Arg(Value),
     Err(PyErr),
+    /// A native call's result, which must be converted into a Python object (with the GIL held)
+    /// before being sent.
+    Deferred(DeferredValue),
+}
+
+/// Converts the result of a native call into a Python object once the GIL is held.
+pub type DeferredValue = Box<dyn FnOnce(Python<'_>) -> Result<Value, Failure> + Send>;
+
+pub enum NativeResult {
+    Value(Value),
+    Deferred(DeferredValue),
 }
 
 ///
@@ -302,6 +313,14 @@ pub(crate) fn generator_send(
     generator: &Value,
     input: GeneratorInput,
 ) -> Result<GeneratorResponse, Failure> {
+    let input = match input {
+        GeneratorInput::Deferred(convert) => match convert(py) {
+            Ok(value) => GeneratorInput::Arg(value),
+            Err(throw @ Failure::Throw { .. }) => GeneratorInput::Err(PyErr::from(throw)),
+            Err(failure) => return Err(failure),
+        },
+        input => input,
+    };
     let (response_unhandled, maybe_thrown) = match input {
         GeneratorInput::Arg(arg) => {
             let response = generator
@@ -433,7 +452,19 @@ pub struct PyGeneratorResponseNativeCall(Mutex<Option<NativeCall>>);
 
 impl PyGeneratorResponseNativeCall {
     pub fn new(call: impl Future<Output = Result<Value, Failure>> + 'static + Send) -> Self {
-        Self(Mutex::new(Some(NativeCall { call: call.boxed() })))
+        Self(Mutex::new(Some(NativeCall {
+            call: call.map(|r| r.map(NativeResult::Value)).boxed(),
+        })))
+    }
+
+    /// Like `new`, but the call's result is converted into a Python object by the engine when it
+    /// next holds the GIL for the calling generator, rather than by the call itself.
+    pub fn new_deferred(
+        call: impl Future<Output = Result<DeferredValue, Failure>> + 'static + Send,
+    ) -> Self {
+        Self(Mutex::new(Some(NativeCall {
+            call: call.map(|r| r.map(NativeResult::Deferred)).boxed(),
+        })))
     }
 
     fn take(&self, py: Python<'_>) -> Result<NativeCall, String> {
@@ -784,7 +815,7 @@ impl RuleCallTrampoline {
 }
 
 pub struct NativeCall {
-    pub call: BoxFuture<'static, Result<Value, Failure>>,
+    pub call: BoxFuture<'static, Result<NativeResult, Failure>>,
 }
 
 #[derive(Clone, Debug)]
