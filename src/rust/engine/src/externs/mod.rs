@@ -350,6 +350,7 @@ pub(crate) fn generator_send(
                 .call_method1(intern!(py, "send"), (py.None(),));
             (response, None)
         }
+        GeneratorInput::Deferred(_) => unreachable!("Converted to an `Arg` or `Err` above."),
     };
 
     let response = match response_unhandled {
