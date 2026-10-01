@@ -710,11 +710,20 @@ impl PyFilespecMatcher {
         excludes: Cow<'_, [String]>,
         py: Python,
     ) -> PyResult<Self> {
-        let matcher =
-            py.detach(|| FilespecMatcher::new(includes, excludes).map_err(PyValueError::new_err))?;
+        let large = includes.len() + excludes.len() > DETACH_THRESHOLD;
+        let build = || FilespecMatcher::new(includes, excludes).map_err(PyValueError::new_err);
+        let matcher = if large {
+            py.detach(build)?
+        } else {
+            build()?
+        };
         Ok(Self(matcher))
     }
 }
+
+/// Below this many globs or paths, glob work stays on the GIL: detaching and re-attaching is a
+/// full GIL handoff, which under a contended GIL costs far more than the work itself.
+const DETACH_THRESHOLD: usize = 256;
 
 #[pymethods]
 impl PyFilespecMatcher {
@@ -757,11 +766,17 @@ impl PyFilespecMatcher {
     }
 
     fn matches(&self, paths: Vec<String>, py: Python) -> PyResult<Vec<String>> {
-        py.detach(|| {
-            Ok(paths
+        let large = paths.len() > DETACH_THRESHOLD;
+        let filter = || {
+            paths
                 .into_iter()
                 .filter(|p| self.0.matches(Path::new(p)))
-                .collect())
+                .collect()
+        };
+        Ok(if large {
+            py.detach(filter)
+        } else {
+            filter()
         })
     }
 }

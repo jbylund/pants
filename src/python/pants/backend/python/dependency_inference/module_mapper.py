@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import functools
 import itertools
 import logging
 import os
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import total_ordering
 from pathlib import PurePath
@@ -32,12 +33,18 @@ from pants.backend.python.target_types import (
     PythonResolveField,
     PythonSourceField,
 )
-from pants.core.util_rules.stripped_source_files import StrippedFileNameRequest, strip_file_name
+from pants.core.util_rules.stripped_source_files import (
+    StrippedFileName,
+    StrippedFileNameRequest,
+    strip_file_name,
+)
 from pants.engine.addresses import Address
 from pants.engine.environment import EnvironmentName
 from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import AllTargets, Target
 from pants.engine.unions import UnionMembership, UnionRule, union
+from pants.source.source_root import SourceRootsRequest, get_optional_source_roots
+from pants.util.dirutil import fast_relpath
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
 from pants.util.strutil import softwrap
@@ -250,10 +257,24 @@ async def map_first_party_python_targets_to_modules(
     all_python_targets: AllPythonTargets,
     python_setup: PythonSetup,
 ) -> FirstPartyPythonMappingImpl:
-    stripped_file_per_target = await concurrently(
-        strip_file_name(StrippedFileNameRequest(tgt[PythonSourceField].file_path))
-        for tgt in all_python_targets.first_party
-    )
+    file_paths = [tgt[PythonSourceField].file_path for tgt in all_python_targets.first_party]
+    source_roots = await get_optional_source_roots(SourceRootsRequest.for_files(file_paths))
+    optional_roots = [
+        source_roots.path_to_optional_root[PurePath(file_path)].source_root
+        for file_path in file_paths
+    ]
+    if all(root is not None for root in optional_roots):
+        stripped_file_per_target: Sequence[StrippedFileName] = [
+            StrippedFileName(
+                file_path if root.path == "." else fast_relpath(file_path, root.path)  # type: ignore[union-attr]
+            )
+            for file_path, root in zip(file_paths, optional_roots)
+        ]
+    else:
+        # Report the files without source roots as stripping them individually does.
+        stripped_file_per_target = await concurrently(
+            strip_file_name(StrippedFileNameRequest(file_path)) for file_path in file_paths
+        )
 
     resolves_to_modules_to_providers: DefaultDict[
         ResolveName, DefaultDict[str, list[ModuleProvider]]
@@ -455,8 +476,47 @@ class PythonModuleOwnersRequest:
     locality: str | None = None
 
 
+@dataclass(frozen=True)
+class PythonModuleOwnersLookup:
+    """Answers `PythonModuleOwnersRequest`s in-process, for callers that look up many modules.
+
+    Looking up each import with `map_module_to_address` costs an engine call per import; this
+    computes the same result directly from the mappings, memoized for as long as the mappings (of
+    which this is a function) are unchanged.
+    """
+
+    first_party_mapping: FirstPartyPythonModuleMapping
+    third_party_mapping: ThirdPartyPythonModuleMapping
+    _cache: dict[PythonModuleOwnersRequest, PythonModuleOwners] = dataclasses.field(
+        default_factory=dict, compare=False, hash=False, repr=False
+    )
+
+    def owners(self, request: PythonModuleOwnersRequest) -> PythonModuleOwners:
+        owners = self._cache.get(request)
+        if owners is None:
+            owners = _compute_module_owners(
+                request, self.first_party_mapping, self.third_party_mapping
+            )
+            self._cache[request] = owners
+        return owners
+
+
+@rule
+async def python_module_owners_lookup(
+    first_party_mapping: FirstPartyPythonModuleMapping,
+    third_party_mapping: ThirdPartyPythonModuleMapping,
+) -> PythonModuleOwnersLookup:
+    return PythonModuleOwnersLookup(first_party_mapping, third_party_mapping)
+
+
 @rule
 async def map_module_to_address(
+    request: PythonModuleOwnersRequest, lookup: PythonModuleOwnersLookup
+) -> PythonModuleOwners:
+    return lookup.owners(request)
+
+
+def _compute_module_owners(
     request: PythonModuleOwnersRequest,
     first_party_mapping: FirstPartyPythonModuleMapping,
     third_party_mapping: ThirdPartyPythonModuleMapping,
@@ -465,6 +525,8 @@ async def map_module_to_address(
         *third_party_mapping.providers_for_module(request.module, resolve=request.resolve),
         *first_party_mapping.providers_for_module(request.module, resolve=request.resolve),
     )
+    if len(possible_providers) < 2:
+        return PythonModuleOwners(tuple(p.provider.addr for p in possible_providers))
 
     # We first attempt to disambiguate conflicting providers by taking - for each provider type -
     # the providers of the closest ancestors to the requested modules.

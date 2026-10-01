@@ -62,6 +62,9 @@ class BuildFileDefaultsParserState:
     defaults: dict[str, Mapping[str, Any]]
     registered_target_types: RegisteredTargetTypes
     union_membership: UnionMembership
+    # The inherited defaults, until defaults are set in this directory: freezing them again would
+    # produce the same values.
+    inherited: BuildFileDefaults | None = None
 
     @classmethod
     def create(
@@ -76,6 +79,7 @@ class BuildFileDefaultsParserState:
             defaults=dict(defaults),
             registered_target_types=registered_target_types,
             union_membership=union_membership,
+            inherited=defaults,
         )
 
     def _freeze_field_value(self, field_type: type[Field], value: Any) -> ImmutableValue:
@@ -91,6 +95,8 @@ class BuildFileDefaultsParserState:
             return field_type.compute_value(raw_value=value, address=self.address)
 
     def get_frozen_defaults(self) -> BuildFileDefaults:
+        if self.inherited is not None:
+            return self.inherited
         types = self.registered_target_types.aliases_to_types
         return BuildFileDefaults(
             {
@@ -138,6 +144,7 @@ class BuildFileDefaultsParserState:
         ignore_unknown_fields: bool = False,
         ignore_unknown_targets: bool = False,
     ) -> None:
+        self.inherited = None
         defaults: dict[str, dict[str, Any]] = (
             {} if not extend else {k: dict(v) for k, v in self.defaults.items()}
         )

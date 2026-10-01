@@ -34,8 +34,8 @@ from pants.engine.internals.selectors import concurrently
 from pants.engine.intrinsics import create_digest, path_globs_to_paths
 from pants.engine.rules import collect_rules, implicitly, rule
 from pants.engine.target import (
-    DependenciesRequest,
     ExplicitlyProvidedDependencies,
+    ExplicitlyProvidedDependenciesRequest,
     FieldSet,
     InferDependenciesRequest,
     InferredDependencies,
@@ -74,7 +74,8 @@ async def get_filtered_entry_point_dependencies(
     # but handles multiple targets and filters the entry_points to just get the requested deps.
     all_explicit_dependencies = await concurrently(
         determine_explicitly_provided_dependencies(
-            **implicitly(DependenciesRequest(tgt[PythonDistributionDependenciesField]))
+            ExplicitlyProvidedDependenciesRequest(tgt[PythonDistributionDependenciesField]),
+            **implicitly(),
         )
         for tgt in request.targets
     )
@@ -199,6 +200,10 @@ class PythonTestsEntryPointDependenciesInferenceFieldSet(FieldSet):
         PythonTestsEntryPointDependenciesField,
     )
     entry_point_dependencies: PythonTestsEntryPointDependenciesField
+
+    @classmethod
+    def opt_out(cls, tgt: Target) -> bool:
+        return tgt[PythonTestsEntryPointDependenciesField].value is None
 
 
 class InferEntryPointDependencies(InferDependenciesRequest):
