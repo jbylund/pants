@@ -28,7 +28,6 @@ from pants.engine.target import (
     AllTargets,
     BulkInferDependenciesRequest,
     BulkInferredDependencies,
-    DependenciesRequest,
     ExplicitlyProvidedDependencies,
     ExplicitlyProvidedDependenciesRequest,
     FieldSet,

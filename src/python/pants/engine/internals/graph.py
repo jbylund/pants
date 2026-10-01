@@ -1862,35 +1862,38 @@ async def validate_dependencies_of_targets(
             else:
                 individual.append(
                     vd_request_type(
-                        vd_request_type.field_set_type.create(tgt),  # type: ignore[misc]
+                        vd_request_type.field_set_type.create(tgt),  # type: ignore[misc,arg-type]
                         dependencies,
                     )
                 )
+    # One iterable argument: both groups may be empty.
     await concurrently(
-        *(
-            bulk_validate_dependencies(
-                **implicitly(
-                    {
-                        bulk_request_types[vd_request_type](
-                            tuple(pairs)
-                        ): BulkValidateDependenciesRequest,
-                        environment_name: EnvironmentName,
-                    }
+        [
+            *(
+                bulk_validate_dependencies(
+                    **implicitly(
+                        {
+                            bulk_request_types[vd_request_type](
+                                tuple(pairs)
+                            ): BulkValidateDependenciesRequest,
+                            environment_name: EnvironmentName,
+                        }
+                    )
                 )
-            )
-            for vd_request_type, pairs in bulk.items()
-        ),
-        *(
-            validate_dependencies(
-                **implicitly(
-                    {
-                        vd_request: ValidateDependenciesRequest,
-                        environment_name: EnvironmentName,
-                    }
+                for vd_request_type, pairs in bulk.items()
+            ),
+            *(
+                validate_dependencies(
+                    **implicitly(
+                        {
+                            vd_request: ValidateDependenciesRequest,
+                            environment_name: EnvironmentName,
+                        }
+                    )
                 )
-            )
-            for vd_request in individual
-        ),
+                for vd_request in individual
+            ),
+        ]
     )
 
 
@@ -1998,7 +2001,7 @@ async def resolve_dependencies_bulk(
             if tgt.address in request.inferred:
                 continue
             for inference_request_type in inference_request_types:
-                if inference_request_type.infer_from.is_applicable(tgt):
+                if inference_request_type.infer_from.is_applicable(tgt):  # type: ignore[misc]
                     to_infer_by_type[inference_request_type].append(tgt)
     try:
         (
@@ -2123,7 +2126,9 @@ async def resolve_dependencies_bulk(
             if explicit
             else FrozenOrderedSet()
         )
-        inferred = request.inferred.get(address) or inferred_by_address.get(address, ())
+        inferred: Sequence[InferredDependencies] = (
+            request.inferred.get(address) or inferred_by_address.get(address) or ()
+        )
         excluded = ignores.union(*itertools.chain(deps.exclude for deps in inferred))
         results[address] = Addresses(
             sorted(
