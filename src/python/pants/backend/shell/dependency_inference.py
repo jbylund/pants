@@ -20,7 +20,7 @@ from pants.engine.addresses import Address
 from pants.engine.collection import DeduplicatedCollection
 from pants.engine.fs import Digest
 from pants.engine.internals.graph import determine_explicitly_provided_dependencies, hydrate_sources
-from pants.engine.intrinsics import execute_process
+from pants.engine.intrinsics import execute_process, get_digest_contents
 from pants.engine.platform import Platform
 from pants.engine.process import Process, ProcessCacheScope
 from pants.engine.rules import Rule, collect_rules, concurrently, implicitly, rule
@@ -57,6 +57,22 @@ class ShellMapping:
     mapping: FrozenDict[str, Address]
     ambiguous_modules: FrozenDict[str, tuple[Address, ...]]
 
+    @property
+    def plain_keys(self) -> tuple[bytes, ...]:
+        keys = self.__dict__.get("_plain_keys")
+        if keys is None:
+            keys = tuple(k.encode() for k in (*self.mapping, *self.ambiguous_modules))
+            object.__setattr__(self, "_plain_keys", keys)
+        return keys
+
+    @property
+    def keys_are_plain(self) -> bool:
+        """Whether every key is ASCII without quote or backslash characters."""
+        return all(
+            key.isascii() and not any(c in key for c in "\"'\\")
+            for key in (*self.mapping, *self.ambiguous_modules)
+        )
+
 
 @rule(desc="Creating map of Shell file names to Shell targets", level=LogLevel.DEBUG)
 async def map_shell_files(tgts: AllShellTargets) -> ShellMapping:
@@ -85,6 +101,23 @@ class ParsedShellImports(DeduplicatedCollection):
     sort_input = True
 
 
+_MAY_SOURCE = re.compile(rb"source|(?:^|[\s;&|({`])\.[ \t]")
+
+
+def _may_mention_any(content: bytes, keys: tuple[bytes, ...]) -> bool:
+    """Whether any key may occur as a (possibly quoted or escaped) literal in the content."""
+    if b"$'" in content:
+        return True
+    try:
+        content.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    normalized = (
+        content.replace(b"\\\n", b"").replace(b'"', b"").replace(b"'", b"").replace(b"\\", b"")
+    )
+    return any(key in normalized for key in keys)
+
+
 @dataclass(frozen=True)
 class ParseShellImportsRequest:
     digest: Digest
@@ -101,6 +134,11 @@ async def parse_shell_imports(
     # We use Shellcheck to parse for us by running it against each file in isolation, which means
     # that all `source` statements will error. Then, we can extract the problematic paths from the
     # JSON output.
+    # Only `source` / `.` commands produce SC1091, so files which cannot contain one need no process.
+    digest_contents = await get_digest_contents(request.digest)
+    if not any(_MAY_SOURCE.search(file_content.content) for file_content in digest_contents):
+        return ParsedShellImports()
+
     downloaded_shellcheck = await download_external_tool(shellcheck.get_request(platform))
 
     immutable_input_key = "__shellcheck_tool"
@@ -180,6 +218,14 @@ async def infer_shell_dependencies(
         hydrate_sources(HydrateSourcesRequest(request.field_set.source), **implicitly()),
     )
     assert len(hydrated_sources.snapshot.files) == 1
+
+    # Only paths which are keys of the mapping can become dependencies, and every path Shellcheck
+    # reports is (after removing quoting) a literal in the file: so if no key occurs in the file,
+    # there are no dependencies to find.
+    if shell_mapping.keys_are_plain:
+        (file_content,) = await get_digest_contents(hydrated_sources.snapshot.digest)
+        if not _may_mention_any(file_content.content, shell_mapping.plain_keys):
+            return InferredDependencies([])
 
     detected_imports = await parse_shell_imports(
         ParseShellImportsRequest(
