@@ -7,6 +7,7 @@ import ast
 import os.path
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from types import CodeType
 from typing import TypeVar
 
 from pants.backend.project_info.filter_targets import FilterSubsystem
@@ -61,6 +62,7 @@ class AddressMap:
         defaults: BuildFileDefaultsParserState,
         dependents_rules: BuildFileDependencyRulesParserState | None,
         dependencies_rules: BuildFileDependencyRulesParserState | None,
+        code: CodeType | None = None,
     ) -> AddressMap:
         """Parses a source for targets.
 
@@ -78,6 +80,7 @@ class AddressMap:
                 defaults,
                 dependents_rules,
                 dependencies_rules,
+                code=code,
             )
         except Exception as e:
             raise MappingError(f"Failed to parse ./{filepath}:\n{type(e).__name__}: {e}")
