@@ -1287,6 +1287,9 @@ async def path_globs_to_digest(
 async def path_globs_to_paths(
     path_globs: PathGlobs,
 ) -> Paths: ...
+async def path_globs_to_snapshots(
+    path_globs: tuple[PathGlobs, ...],
+) -> tuple[Snapshot, ...]: ...
 async def download_file(
     native_download_file: NativeDownloadFile,
 ) -> Digest: ...
