@@ -525,6 +525,8 @@ def _compute_module_owners(
         *third_party_mapping.providers_for_module(request.module, resolve=request.resolve),
         *first_party_mapping.providers_for_module(request.module, resolve=request.resolve),
     )
+    if len(possible_providers) < 2:
+        return PythonModuleOwners(tuple(p.provider.addr for p in possible_providers))
 
     # We first attempt to disambiguate conflicting providers by taking - for each provider type -
     # the providers of the closest ancestors to the requested modules.
