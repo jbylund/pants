@@ -30,7 +30,7 @@ from pants.engine.process import (
 )
 from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.unions import UnionRule
-from pants.jvm.jdk_rules import InternalJdk, JvmProcess
+from pants.jvm.jdk_rules import InternalJdk, JvmProcess, internal_jdk
 from pants.jvm.resolve.coursier_fetch import ToolClasspathRequest, materialize_classpath_for_tool
 from pants.jvm.resolve.jvm_tool import GenerateJvmLockfileFromTool, JvmToolBase
 from pants.util.frozendict import FrozenDict
@@ -235,9 +235,11 @@ def _load_javaparser_launcher_source() -> bytes:
 
 # TODO(13879): Consolidate compilation of wrapper binaries to common rules.
 @rule
-async def build_processors(jdk: InternalJdk, tool: JavaParser) -> JavaParserCompiledClassfiles:
+async def build_processors(tool: JavaParser) -> JavaParserCompiledClassfiles:
     dest_dir = "classfiles"
-    materialized_classpath, source_digest = await concurrently(
+    # The tool's classpath does not depend on the JDK: fetch both at once.
+    jdk, materialized_classpath, source_digest = await concurrently(
+        internal_jdk(**implicitly()),
         materialize_classpath_for_tool(
             ToolClasspathRequest(
                 prefix="__toolcp", lockfile=GenerateJvmLockfileFromTool.create(tool)
