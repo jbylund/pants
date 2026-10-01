@@ -885,7 +885,9 @@ async def transitive_dependency_mapping(request: _DependencyMappingRequest) -> _
     Unlike a traditional BFS algorithm, we batch each round of traversals via `concurrently` for
     improved performance / concurrency.
     """
-    roots_as_targets = await resolve_unexpanded_targets(Addresses(request.tt_request.roots))
+    roots_as_targets = await resolve_unexpanded_targets(
+        Addresses(request.tt_request.roots), **implicitly()
+    )
     visited: OrderedSet[Target] = OrderedSet()
     queued = FrozenOrderedSet(roots_as_targets)
     dependency_mapping: dict[Address, tuple[Address, ...]] = {}

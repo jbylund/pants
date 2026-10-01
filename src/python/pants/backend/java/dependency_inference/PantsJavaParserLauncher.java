@@ -116,9 +116,9 @@ public class PantsJavaParserLauncher {
   }
 
   /**
-   * Analyzes each pair of (output path, source path) arguments. With a single pair, a failure
-   * fails the process. With several pairs, a failure to analyze one source is recorded in a file
-   * next to its output path (with the suffix `.error`), and the other sources are still analyzed.
+   * Analyzes each pair of (output path, source path) arguments. With a single pair, a failure fails
+   * the process. With several pairs, a failure to analyze one source is recorded in a file next to
+   * its output path (with the suffix `.error`), and the other sources are still analyzed.
    */
   public static void main(String[] args) throws Exception {
     if (args.length == 2) {
@@ -136,8 +136,7 @@ public class PantsJavaParserLauncher {
     }
   }
 
-  private static void analyze(String analysisOutputPath, String sourceToAnalyze)
-      throws Exception {
+  private static void analyze(String analysisOutputPath, String sourceToAnalyze) throws Exception {
 
     // NB: We hardcode the most permissive language level in order to capture all potential
     // sources of symbols. If certain syntax ends up deprecated in future versions, we may need to
