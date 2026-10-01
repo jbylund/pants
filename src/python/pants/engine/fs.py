@@ -147,6 +147,17 @@ class GlobExpansionConjunction(Enum):
 
 
 @dataclass(frozen=True)
+class PathGlobsBatch:
+    """A request to snapshot each of several PathGlobs."""
+
+    path_globs: tuple[PathGlobs, ...]
+
+
+class Snapshots(Collection[Snapshot]):
+    """Snapshots in the order of the PathGlobs of a `PathGlobsBatch`."""
+
+
+@dataclass(frozen=True)
 class PathGlobsAndRoot:
     """A set of PathGlobs to capture relative to some root (which may exist outside of the
     buildroot).
