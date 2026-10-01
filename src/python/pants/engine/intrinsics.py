@@ -17,11 +17,13 @@ from pants.engine.fs import (
     MergeDigests,
     NativeDownloadFile,
     PathGlobs,
+    PathGlobsBatch,
     PathMetadataRequest,
     PathMetadataResult,
     Paths,
     RemovePrefix,
     Snapshot,
+    Snapshots,
 )
 from pants.engine.internals import native_engine
 from pants.engine.internals.docker import DockerResolveImageRequest, DockerResolveImageResult
@@ -58,6 +60,11 @@ async def path_globs_to_digest(
     path_globs: PathGlobs,
 ) -> Digest:
     return await native_engine.path_globs_to_digest(path_globs)
+
+
+@rule
+async def path_globs_to_snapshots(batch: PathGlobsBatch) -> Snapshots:
+    return Snapshots(await native_engine.path_globs_to_snapshots(batch.path_globs))
 
 
 @rule

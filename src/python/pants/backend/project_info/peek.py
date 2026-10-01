@@ -21,14 +21,15 @@ from pants.engine.addresses import Address, Addresses
 from pants.engine.collection import Collection
 from pants.engine.console import Console
 from pants.engine.environment import EnvironmentName
-from pants.engine.fs import Snapshot
+from pants.engine.fs import PathGlobsBatch, Snapshot
 from pants.engine.goal import Goal, GoalSubsystem, Outputting
 from pants.engine.internals.build_files import (
     _get_target_family_and_adaptor_for_dep_rules,
     get_dependencies_rule_application,
 )
 from pants.engine.internals.dep_rules import DependencyRuleApplication, DependencyRuleSet
-from pants.engine.internals.graph import filter_targets, hydrate_sources, resolve_targets
+from pants.engine.internals.graph import filter_targets, resolve_targets
+from pants.engine.intrinsics import path_globs_to_snapshots
 from pants.engine.rules import Rule, collect_rules, concurrently, goal_rule, implicitly, rule
 from pants.engine.target import (
     AlwaysTraverseDeps,
@@ -37,13 +38,13 @@ from pants.engine.target import (
     DependenciesRuleApplicationRequest,
     Field,
     FieldSet,
-    HydrateSourcesRequest,
     ImmutableValue,
     SourcesField,
     Target,
     UnexpandedTargets,
 )
 from pants.engine.unions import UnionMembership, union
+from pants.option.bootstrap_options import UnmatchedBuildFileGlobs
 from pants.option.option_types import BoolOption
 from pants.util.frozendict import FrozenDict
 from pants.util.strutil import softwrap
@@ -289,6 +290,7 @@ async def get_target_data(
     targets: UnexpandedTargets,
     subsys: PeekSubsystem,
     union_membership: UnionMembership,
+    unmatched_build_file_globs: UnmatchedBuildFileGlobs,
 ) -> TargetDatas:
     """Given a set of unexpanded targets, return a mapping of target addresses to their data.
 
@@ -307,8 +309,9 @@ async def get_target_data(
     targets_with_sources = [tgt for tgt in sorted_targets if tgt.has_field(SourcesField)]
 
     # When determining dependencies, we replace target generators with their generated targets.
-    # Sources are hydrated at the same time, since neither depends on the other.
-    dependencies_per_target, hydrated_sources_per_target = await concurrently(
+    # Sources are hydrated at the same time, since neither depends on the other. Hydrating a
+    # sources field without codegen is snapshotting its globs, so all are snapshotted in one batch.
+    dependencies_per_target, sources_snapshots = await concurrently(
         concurrently(
             resolve_targets(
                 **implicitly(
@@ -319,11 +322,17 @@ async def get_target_data(
             )
             for tgt in sorted_targets
         ),
-        concurrently(
-            hydrate_sources(HydrateSourcesRequest(tgt[SourcesField]), **implicitly())
-            for tgt in targets_with_sources
+        path_globs_to_snapshots(
+            PathGlobsBatch(
+                tuple(
+                    tgt[SourcesField].path_globs(unmatched_build_file_globs)
+                    for tgt in targets_with_sources
+                )
+            )
         ),
     )
+    for tgt, snapshot in zip(targets_with_sources, sources_snapshots):
+        tgt[SourcesField].validate_resolved_files(snapshot.files)
     if subsys.include_additional_info:
         additional_info_field_sets = [
             field_set_type.create(tgt)
@@ -347,8 +356,7 @@ async def get_target_data(
 
     # TODO: This feels like something that could be merged with the above code somewhere
     expanded_sources_map = {
-        tgt.address: hs.snapshot
-        for tgt, hs in zip(targets_with_sources, hydrated_sources_per_target)
+        tgt.address: snapshot for tgt, snapshot in zip(targets_with_sources, sources_snapshots)
     }
 
     expanded_dependencies = [
