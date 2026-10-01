@@ -34,7 +34,6 @@ from pants.engine.internals.selectors import concurrently
 from pants.engine.intrinsics import create_digest, path_globs_to_paths
 from pants.engine.rules import collect_rules, implicitly, rule
 from pants.engine.target import (
-    DependenciesRequest,
     ExplicitlyProvidedDependencies,
     ExplicitlyProvidedDependenciesRequest,
     FieldSet,

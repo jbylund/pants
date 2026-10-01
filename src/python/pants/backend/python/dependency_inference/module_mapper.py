@@ -10,7 +10,7 @@ import itertools
 import logging
 import os
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import total_ordering
 from pathlib import PurePath
@@ -38,13 +38,13 @@ from pants.core.util_rules.stripped_source_files import (
     StrippedFileNameRequest,
     strip_file_name,
 )
-from pants.source.source_root import SourceRootsRequest, get_optional_source_roots
-from pants.util.dirutil import fast_relpath
 from pants.engine.addresses import Address
 from pants.engine.environment import EnvironmentName
 from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import AllTargets, Target
 from pants.engine.unions import UnionMembership, UnionRule, union
+from pants.source.source_root import SourceRootsRequest, get_optional_source_roots
+from pants.util.dirutil import fast_relpath
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
 from pants.util.strutil import softwrap
@@ -264,7 +264,7 @@ async def map_first_party_python_targets_to_modules(
         for file_path in file_paths
     ]
     if all(root is not None for root in optional_roots):
-        stripped_file_per_target = [
+        stripped_file_per_target: Sequence[StrippedFileName] = [
             StrippedFileName(
                 file_path if root.path == "." else fast_relpath(file_path, root.path)  # type: ignore[union-attr]
             )
