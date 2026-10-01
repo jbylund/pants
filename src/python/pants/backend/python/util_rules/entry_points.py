@@ -36,6 +36,7 @@ from pants.engine.rules import collect_rules, implicitly, rule
 from pants.engine.target import (
     DependenciesRequest,
     ExplicitlyProvidedDependencies,
+    ExplicitlyProvidedDependenciesRequest,
     FieldSet,
     InferDependenciesRequest,
     InferredDependencies,
@@ -74,7 +75,8 @@ async def get_filtered_entry_point_dependencies(
     # but handles multiple targets and filters the entry_points to just get the requested deps.
     all_explicit_dependencies = await concurrently(
         determine_explicitly_provided_dependencies(
-            **implicitly(DependenciesRequest(tgt[PythonDistributionDependenciesField]))
+            ExplicitlyProvidedDependenciesRequest(tgt[PythonDistributionDependenciesField]),
+            **implicitly(),
         )
         for tgt in request.targets
     )
