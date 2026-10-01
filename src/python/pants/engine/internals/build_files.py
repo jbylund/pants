@@ -27,6 +27,7 @@ from pants.build_graph.address import (
     ResolveError,
 )
 from pants.core.util_rules.env_vars import environment_vars_subset
+from pants.engine.addresses import Addresses
 from pants.engine.engine_aware import EngineAwareParameter
 from pants.engine.env_vars import CompleteEnvironmentVars, EnvironmentVars, EnvironmentVarsRequest
 from pants.engine.fs import FileContent, GlobMatchErrorBehavior, PathGlobs
