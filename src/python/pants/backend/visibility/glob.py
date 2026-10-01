@@ -56,6 +56,12 @@ class Glob:
         return self.raw
 
 
+_MISSING = object()
+_ADDRESS_PATH_CACHE: dict[Address, str] = {}
+# Pure functions of their keys, so caching is exact.
+_INVOKED_PATH_CACHE: dict[tuple[str, str, int], str | None] = {}
+
+
 class PathGlobAnchorMode(Enum):
     PROJECT_ROOT = "//"
     DECLARED_PATH = "/"
@@ -128,25 +134,55 @@ class PathGlob:
             uplvl=uplvl,
         )
 
+    @property
+    def _required_pieces(self) -> tuple[str, ...]:
+        """Literal parts of the pattern which occur in every path it matches.
+
+        The regexp contains the parts between `*`s verbatim, except that a `/` next to a `**` is
+        optional.
+        """
+        pieces = self.__dict__.get("_required_pieces_cache")
+        if pieces is None:
+            pieces = tuple(piece.strip("/") for piece in self.raw.split("*") if piece.strip("/"))
+            object.__setattr__(self, "_required_pieces_cache", pieces)
+        return pieces
+
+    @property
+    def matches_everything(self) -> bool:
+        """Whether every path matches, whatever the base."""
+        return self.anchor_mode is PathGlobAnchorMode.FLOATING and self.raw in ("*", "**")
+
     def _match_path(self, path: str, base: str) -> str | None:
         if self.anchor_mode is PathGlobAnchorMode.INVOKED_PATH:
-            path = os.path.relpath(path or ".", base + "/.." * self.uplvl)
-            if path.startswith(".."):
-                # The `path` is not in the sub tree of `base`.
-                return None
+            key = (path, base, self.uplvl)
+            relative = _INVOKED_PATH_CACHE.get(key, _MISSING)
+            if relative is _MISSING:
+                relative = os.path.relpath(path or ".", base + "/.." * self.uplvl)
+                # The `path` is not in the sub tree of `base` if it starts with `..`.
+                relative = None if relative.startswith("..") else relative.lstrip(".")
+                _INVOKED_PATH_CACHE[key] = relative
+            return relative  # type: ignore[return-value]
         return path.lstrip(".")
 
     def match(self, path: str, base: str) -> bool:
         match_path = self._match_path(path, base)
-        return (
-            False
-            if match_path is None
-            else bool(
-                (re.search if self.anchor_mode is PathGlobAnchorMode.FLOATING else re.match)(
-                    self.glob, match_path
-                )
+        if match_path is None:
+            return False
+        if not all(piece in match_path for piece in self._required_pieces):
+            return False
+        cache = self.__dict__.get("_match_cache")
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_match_cache", cache)
+        matched = cache.get(match_path)
+        if matched is None:
+            matcher = (
+                self.glob.search
+                if self.anchor_mode is PathGlobAnchorMode.FLOATING
+                else self.glob.match
             )
-        )
+            matched = cache[match_path] = bool(matcher(match_path))
+        return matched
 
 
 RULE_REGEXP = "|".join(
@@ -275,12 +311,24 @@ class TargetGlob:
 
     @staticmethod
     def address_path(address: Address) -> str:
-        if address.is_file_target:
-            return address.filename
-        elif address.is_generated_target:
-            return address.spec.replace(":", "/").lstrip("/")
-        else:
-            return address.spec_path
+        path = _ADDRESS_PATH_CACHE.get(address)
+        if path is None:
+            if address.is_file_target:
+                path = address.filename
+            elif address.is_generated_target:
+                path = address.spec.replace(":", "/").lstrip("/")
+            else:
+                path = address.spec_path
+            _ADDRESS_PATH_CACHE[address] = path
+        return path
+
+    @property
+    def matches_everything(self) -> bool:
+        return (
+            not (self.type_ or self.name or self.tags)
+            and self.path is not None
+            and self.path.matches_everything
+        )
 
     def match(self, address: Address, adaptor: TargetAdaptor, base: str) -> bool:
         if not (self.type_ or self.name or self.path or self.tags):
