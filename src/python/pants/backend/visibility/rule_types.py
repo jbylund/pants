@@ -200,6 +200,44 @@ class BuildFileVisibilityRules(BuildFileDependencyRules):
         return BuildFileVisibilityRulesParserState(path, cast(BuildFileVisibilityRules, parent))
 
     @classmethod
+    def dependency_rule_action(
+        cls,
+        *,
+        origin_address: Address,
+        origin_adaptor: TargetAdaptor,
+        dependencies_rules: BuildFileDependencyRules | None,
+        dependency_address: Address,
+        dependency_adaptor: TargetAdaptor,
+        dependents_rules: BuildFileDependencyRules | None,
+    ) -> DependencyRuleAction | None:
+        """The action `check_dependency_rules` would return, or None if it would raise."""
+        out_action = (
+            cast(BuildFileVisibilityRules, dependencies_rules).get_action(
+                address=origin_address,
+                adaptor=origin_adaptor,
+                other_address=dependency_address,
+                other_adaptor=dependency_adaptor,
+            )[1]
+            if dependencies_rules is not None
+            else DependencyRuleAction.ALLOW
+        )
+        in_action = (
+            cast(BuildFileVisibilityRules, dependents_rules).get_action(
+                address=dependency_address,
+                adaptor=dependency_adaptor,
+                other_address=origin_address,
+                other_adaptor=origin_adaptor,
+            )[1]
+            if dependents_rules is not None
+            else DependencyRuleAction.ALLOW
+        )
+        if out_action is None or in_action is None:
+            return None
+        if in_action is DependencyRuleAction.DENY or out_action is DependencyRuleAction.ALLOW:
+            return in_action
+        return out_action
+
+    @classmethod
     def check_dependency_rules(
         cls,
         *,
