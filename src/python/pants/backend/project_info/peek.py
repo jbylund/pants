@@ -311,19 +311,22 @@ async def get_target_data(
     targets_with_sources = [tgt for tgt in sorted_targets if tgt.has_field(SourcesField)]
 
     # When determining dependencies, we replace target generators with their generated targets.
-    dependencies_per_target = await concurrently(
-        resolve_targets(
-            **implicitly(
-                DependenciesRequest(
-                    tgt.get(Dependencies), should_traverse_deps_predicate=AlwaysTraverseDeps()
+    # Sources are hydrated at the same time, since neither depends on the other.
+    dependencies_per_target, hydrated_sources_per_target = await concurrently(
+        concurrently(
+            resolve_targets(
+                **implicitly(
+                    DependenciesRequest(
+                        tgt.get(Dependencies), should_traverse_deps_predicate=AlwaysTraverseDeps()
+                    )
                 )
             )
-        )
-        for tgt in sorted_targets
-    )
-    hydrated_sources_per_target = await concurrently(
-        hydrate_sources(HydrateSourcesRequest(tgt[SourcesField]), **implicitly())
-        for tgt in targets_with_sources
+            for tgt in sorted_targets
+        ),
+        concurrently(
+            hydrate_sources(HydrateSourcesRequest(tgt[SourcesField]), **implicitly())
+            for tgt in targets_with_sources
+        ),
     )
     if subsys.include_additional_info:
         additional_info_field_sets = [
