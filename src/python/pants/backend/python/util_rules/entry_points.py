@@ -200,6 +200,10 @@ class PythonTestsEntryPointDependenciesInferenceFieldSet(FieldSet):
     )
     entry_point_dependencies: PythonTestsEntryPointDependenciesField
 
+    @classmethod
+    def opt_out(cls, tgt: Target) -> bool:
+        return tgt[PythonTestsEntryPointDependenciesField].value is None
+
 
 class InferEntryPointDependencies(InferDependenciesRequest):
     infer_from = PythonTestsEntryPointDependenciesInferenceFieldSet
