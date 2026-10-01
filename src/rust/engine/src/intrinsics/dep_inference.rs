@@ -335,9 +335,14 @@ where
     futures::stream::iter(files.into_iter().map(|file| {
         let dependencies_parser = dependencies_parser.clone();
         async move {
-            let cache_key = request.cache_key_for_file(&file.path, file.digest);
-            if let Some(result) = lookup_inferred_dependencies(&cache_key, core).await? {
-                return Ok::<_, Failure>((file.path, result));
+            // With the local cache disabled, its results may not be read or written.
+            let cache_key = core
+                .local_cache_enabled
+                .then(|| request.cache_key_for_file(&file.path, file.digest));
+            if let Some(cache_key) = &cache_key {
+                if let Some(result) = lookup_inferred_dependencies(cache_key, core).await? {
+                    return Ok::<_, Failure>((file.path, result));
+                }
             }
             let path = file.path.clone();
             let result = store
@@ -347,14 +352,16 @@ where
                         .and_then(|contents| dependencies_parser(contents, &path))
                 })
                 .await??;
-            core.local_cache
-                .store(
-                    &cache_key,
-                    Bytes::from(serde_json::to_string(&result).map_err(|e| {
-                        format!("Failed to serialize dep inference cache result: {e}")
-                    })?),
-                )
-                .await?;
+            if let Some(cache_key) = &cache_key {
+                core.local_cache
+                    .store(
+                        cache_key,
+                        Bytes::from(serde_json::to_string(&result).map_err(|e| {
+                            format!("Failed to serialize dep inference cache result: {e}")
+                        })?),
+                    )
+                    .await?;
+            }
             Ok((file.path, result))
         }
     }))

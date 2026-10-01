@@ -83,6 +83,9 @@ pub struct Core {
     pub watcher: Option<Arc<InvalidationWatcher>>,
     pub build_root: PathBuf,
     pub local_parallelism: usize,
+    /// Whether results of in-process work (such as dependency inference) may be persisted to and
+    /// read from the local cache.
+    pub local_cache_enabled: bool,
     pub remote_parallelism: Option<usize>,
     pub graceful_shutdown_timeout: Duration,
     pub sessions: Sessions,
@@ -763,6 +766,7 @@ impl Core {
             build_root,
             watcher,
             local_parallelism: exec_strategy_opts.local_parallelism,
+            local_cache_enabled: exec_strategy_opts.local_cache,
             remote_parallelism: remoting_opts
                 .execution_enable
                 .then_some(exec_strategy_opts.remote_parallelism),
