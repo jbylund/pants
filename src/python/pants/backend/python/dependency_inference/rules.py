@@ -6,23 +6,29 @@ from __future__ import annotations
 import itertools
 import logging
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import PurePath
 
+from pants.backend.project_info.peek import PeekBulkDependencies, PeekBulkDependenciesRequest
 from pants.backend.python.dependency_inference import module_mapper, parse_python_dependencies
 from pants.backend.python.dependency_inference.default_unowned_dependencies import (
     DEFAULT_UNOWNED_DEPENDENCIES,
 )
 from pants.backend.python.dependency_inference.module_mapper import (
     AllPythonTargets,
+    FirstPartyPythonModuleMapping,
     PythonModuleOwners,
     PythonModuleOwnersLookup,
     PythonModuleOwnersRequest,
     ResolveName,
+    ThirdPartyPythonModuleMapping,
     map_module_to_address,
+    map_third_party_modules_to_addresses,
+    merge_first_party_module_mappings,
     module_from_stripped_path,
+    module_owners,
 )
 from pants.backend.python.dependency_inference.parse_python_dependencies import (
     ParsedPythonAssetPaths,
@@ -48,7 +54,11 @@ from pants.backend.python.target_types import (
     PythonTestSourceField,
 )
 from pants.backend.python.util_rules import ancestor_files, pex
-from pants.backend.python.util_rules.ancestor_files import AncestorFilesRequest, find_ancestor_files
+from pants.backend.python.util_rules.ancestor_files import (
+    AncestorFilesRequest,
+    find_ancestor_files,
+    putative_ancestor_files,
+)
 from pants.base.glob_match_error_behavior import GlobMatchErrorBehavior
 from pants.core import target_types
 from pants.core.target_types import AllAssetTargetsByPath, map_assets_by_path
@@ -59,33 +69,49 @@ from pants.core.util_rules.unowned_dependency_behavior import (
     UnownedDependencyUsage,
 )
 from pants.engine.addresses import Address, Addresses
+from pants.engine.environment import ChosenLocalEnvironmentName, EnvironmentName
 from pants.engine.fs import PathGlobs, RemovePrefix
 from pants.engine.internals.build_files import DELETED_ADDRESS
 from pants.engine.internals.graph import (
     OwnersRequest,
     determine_explicitly_provided_dependencies,
     find_owners,
+    resolve_dependencies_bulk,
     resolve_targets,
 )
 from pants.engine.internals.native_engine import NativeDependenciesRequest
-from pants.engine.intrinsics import digest_to_snapshot, parse_python_deps, remove_prefix
+from pants.engine.intrinsics import (
+    digest_to_snapshot,
+    get_digest_contents,
+    parse_python_deps,
+    remove_prefix,
+)
 from pants.engine.rules import concurrently, implicitly, rule
 from pants.engine.target import (
+    BulkDependenciesRequest,
     DependenciesRequest,
     ExplicitlyProvidedDependencies,
+    ExplicitlyProvidedDependenciesRequest,
     FieldSet,
     InferDependenciesRequest,
     InferredDependencies,
+    SpecialCasedDependencies,
+    Target,
+    ValidateDependenciesRequest,
+    applicable_field_set_types,
 )
-from pants.engine.unions import UnionRule
+from pants.engine.unions import UnionMembership, UnionRule
 from pants.source.source_root import (
     SourceRootRequest,
     SourceRootsRequest,
+    get_optional_source_root,
     get_optional_source_roots,
     get_source_root,
 )
 from pants.util.docutil import doc_url
 from pants.util.frozendict import FrozenDict
+from pants.util.logging import LogLevel
+from pants.util.ordered_set import FrozenOrderedSet
 from pants.util.strutil import bullet_list, softwrap
 from pants.vcs.changed import DeletedFiles, get_deleted_files
 
@@ -444,21 +470,13 @@ async def parse_directory_python_dependencies(
 ) -> DirectoryPythonDependencies:
     empty = DirectoryPythonDependencies(FrozenDict())
     prefix = f"{request.directory}/" if request.directory else ""
-    snapshot = await digest_to_snapshot(
-        **implicitly(PathGlobs([f"{prefix}*.py", f"{prefix}*.pyi"]))
+    snapshot, optional_source_root = await concurrently(
+        digest_to_snapshot(**implicitly(PathGlobs([f"{prefix}*.py", f"{prefix}*.pyi"]))),
+        get_optional_source_root(SourceRootRequest(PurePath(request.directory)), **implicitly()),
     )
     if not snapshot.files:
         return empty
-    source_roots_result = await get_optional_source_roots(
-        SourceRootsRequest.for_files(snapshot.files)
-    )
-    source_roots = {
-        optional_root.source_root
-        for optional_root in source_roots_result.path_to_optional_root.values()
-    }
-    if len(source_roots) != 1:
-        return empty
-    (source_root,) = source_roots
+    source_root = optional_source_root.source_root
     if source_root is None:
         return empty
     stripped_digest = (
@@ -523,7 +541,7 @@ async def resolve_parsed_dependencies(
         parsed_imports = ParsedPythonImports([])
 
     explicitly_provided_deps = await determine_explicitly_provided_dependencies(
-        **implicitly(DependenciesRequest(request.field_set.dependencies))
+        ExplicitlyProvidedDependenciesRequest(request.field_set.dependencies), **implicitly()
     )
 
     # Only set locality if needed, to avoid unnecessary rule graph memoization misses.
@@ -742,11 +760,249 @@ async def infer_python_conftest_dependencies(
     return InferredDependencies([*indexed_owners, *python_owners])
 
 
+async def _explicit_dependencies_or_none(
+    targets: Sequence[Target],
+) -> tuple[ExplicitlyProvidedDependencies, ...] | None:
+    """The explicitly provided dependencies of the targets, or None if any fail to resolve."""
+    try:
+        return tuple(
+            await concurrently(
+                determine_explicitly_provided_dependencies(
+                    ExplicitlyProvidedDependenciesRequest(tgt[PythonDependenciesField]),
+                    **implicitly(),
+                )
+                for tgt in targets
+            )
+        )
+    except Exception:
+        return None
+
+
+class PythonPeekBulkDependenciesRequest(PeekBulkDependenciesRequest):
+    @classmethod
+    def candidates(
+        cls, targets: Iterable[Target], union_membership: UnionMembership
+    ) -> tuple[Target, ...]:
+        handled_inference_types = {
+            InferPythonImportDependencies,
+            InferInitDependencies,
+            InferConftestDependencies,
+        }
+        inference_types = union_membership.get(InferDependenciesRequest)
+        unhandled_field_set_types = tuple(
+            inference_type.infer_from
+            for inference_type in inference_types
+            if inference_type not in handled_inference_types
+        )
+        return tuple(
+            tgt
+            for tgt in targets
+            if tgt.has_field(PythonSourceField)
+            and tgt.has_field(PythonDependenciesField)
+            and tgt.has_field(PythonResolveField)
+            and not applicable_field_set_types(unhandled_field_set_types, tgt)
+            and tgt[PythonSourceField].file_path.endswith((".py", ".pyi"))
+        )
+
+
+@rule(desc="Resolve Python dependencies in bulk", level=LogLevel.DEBUG)
+async def get_python_peek_bulk_dependencies(
+    request: PythonPeekBulkDependenciesRequest,
+    python_setup: PythonSetup,
+    python_infer_subsystem: PythonInferSubsystem,
+    local_environment_name: ChosenLocalEnvironmentName,
+) -> PeekBulkDependencies:
+    """Resolves the dependencies of Python file targets whose dependencies come only from import,
+    `__init__.py` and `conftest.py` inference, without resolving each target individually.
+
+    Targets for which any other source of dependencies applies, or for which anything unusual comes
+    up (unowned imports, unparsable files, owners outside the index), are left to the per-target
+    path, which also produces any errors.
+    """
+    if python_infer_subsystem.assets or (
+        python_infer_subsystem.ambiguity_resolution != AmbiguityResolution.none
+    ):
+        return PeekBulkDependencies(FrozenDict())
+
+    candidates = request.targets
+    if not candidates:
+        return PeekBulkDependencies(FrozenDict())
+
+    file_paths = [tgt[PythonSourceField].file_path for tgt in candidates]
+    directories = sorted({os.path.dirname(fp) for fp in file_paths})
+
+    init_names: tuple[str, ...] = (
+        ()
+        if python_infer_subsystem.init_files is InitFilesInference.never
+        else ("__init__.py", "__init__.pyi")
+    )
+    conftest_names: tuple[str, ...] = ("conftest.py",) if python_infer_subsystem.conftests else ()
+    requested_names = (*init_names, *conftest_names)
+    # A file's putative ancestor files are those of any file in its directory, except itself.
+    putative_by_directory = {
+        directory: putative_ancestor_files(
+            (os.path.join(directory, "__peek_bulk_placeholder__.py"),), requested_names
+        )
+        for directory in directories
+    }
+    all_putative = sorted(set().union(*putative_by_directory.values()))
+
+    with_explicit = [tgt for tgt in candidates if tgt[PythonDependenciesField].value]
+
+    # Nothing but the loop below needs the module mappings: start everything at once.
+    (
+        explicit_results,
+        first_party_mapping,
+        third_party_mapping,
+        directory_results,
+        ancestor_contents,
+        owners_by_file,
+    ) = await concurrently(
+        _explicit_dependencies_or_none(with_explicit),
+        merge_first_party_module_mappings(**implicitly()),
+        map_third_party_modules_to_addresses(**implicitly()),
+        concurrently(
+            parse_directory_python_dependencies(
+                DirectoryPythonDependenciesRequest(directory), **implicitly()
+            )
+            for directory in directories
+        ),
+        get_digest_contents(**implicitly({PathGlobs(all_putative): PathGlobs})),
+        get_python_source_owners_by_file(**implicitly()),
+    )
+    module_owners_lookup = PythonModuleOwnersLookup(first_party_mapping, third_party_mapping)
+    if explicit_results is None:
+        return PeekBulkDependencies(FrozenDict())
+    explicit_by_address = {
+        tgt.address: explicit for tgt, explicit in zip(with_explicit, explicit_results)
+    }
+    parsed_by_file: dict[str, PythonFileDependencies] = {}
+    for directory_result in directory_results:
+        parsed_by_file.update(directory_result.by_file)
+
+    ignore_empty_init_files = python_infer_subsystem.init_files is InitFilesInference.content_only
+    existing_init_files = set()
+    existing_conftest_files = set()
+    for file_content in ancestor_contents:
+        name = os.path.basename(file_content.path)
+        if name in init_names and (not ignore_empty_init_files or file_content.content.strip()):
+            existing_init_files.add(file_content.path)
+        elif name in conftest_names:
+            existing_conftest_files.add(file_content.path)
+
+    no_explicit_dependencies: dict[Address, ExplicitlyProvidedDependencies] = {}
+    inferred: dict[Address, tuple[InferredDependencies, ...]] = {}
+    owners_by_module_and_resolve: dict[tuple[str, str], PythonModuleOwners] = {}
+    resolves_by_raw_value: dict[str | None, str] = {}
+    ancestor_owners_by_directory: dict[tuple[str, str, bool], tuple[list, list]] = {}
+    declined_directories: set[tuple[str, str, bool]] = set()
+    for tgt, fp in zip(candidates, file_paths):
+        parsed = parsed_by_file.get(fp)
+        if parsed is None:
+            continue
+        address = tgt.address
+        resolve_field = tgt[PythonResolveField]
+        resolve = resolves_by_raw_value.get(resolve_field.value)
+        if resolve is None:
+            resolve = resolves_by_raw_value[resolve_field.value] = resolve_field.normalized_value(
+                python_setup
+            )
+
+        import_deps: frozenset[Address] = frozenset()
+        if python_infer_subsystem.imports and parsed.imports:
+            owners_per_import = []
+            all_unambiguous = True
+            for imported_module in parsed.imports:
+                owners = owners_by_module_and_resolve.get((imported_module, resolve))
+                if owners is None:
+                    owners = owners_by_module_and_resolve[(imported_module, resolve)] = (
+                        module_owners_lookup.owners(
+                            PythonModuleOwnersRequest(imported_module, resolve, None)
+                        )
+                    )
+                owners_per_import.append(owners)
+                if not owners.unambiguous:
+                    all_unambiguous = False
+            if all_unambiguous:
+                import_deps = frozenset(
+                    owner for owners in owners_per_import for owner in owners.unambiguous
+                )
+            else:
+                explicit = explicit_by_address.get(address) or no_explicit_dependencies.setdefault(
+                    address,
+                    ExplicitlyProvidedDependencies(address, FrozenOrderedSet(), FrozenOrderedSet()),
+                )
+                resolve_results = _get_imports_info(
+                    address=address,
+                    owners_per_import=owners_per_import,
+                    parsed_imports=parsed.imports,
+                    explicitly_provided_deps=explicit,
+                )
+                import_deps, unowned_imports = _collect_imports_info(resolve_results)
+                if _remove_ignored_imports(
+                    unowned_imports, python_infer_subsystem.ignored_unowned_imports
+                ):
+                    continue
+
+        directory = os.path.dirname(fp)
+        is_test = tgt.has_field(PythonTestSourceField)
+        # Files named like the requested ones are excluded from their own ancestors, so their
+        # results are not shared with the rest of their directory.
+        shareable = os.path.basename(fp) not in requested_names
+        ancestor_key = (directory, resolve, is_test)
+        if shareable and ancestor_key in declined_directories:
+            continue
+        ancestor_owners = ancestor_owners_by_directory.get(ancestor_key) if shareable else None
+        if ancestor_owners is None:
+            putative = putative_by_directory[directory]
+            if not shareable:
+                putative = putative - {fp}
+            init_owners = [
+                owner
+                for f in sorted(putative & existing_init_files)
+                for owner, owner_resolve in owners_by_file.owners.get(f, ())
+                if owner_resolve == resolve
+            ]
+            conftest_files = sorted(putative & existing_conftest_files) if is_test else []
+            if any(f not in owners_by_file.owners for f in conftest_files):
+                if shareable:
+                    declined_directories.add(ancestor_key)
+                continue
+            conftest_owners = [
+                owner
+                for f in conftest_files
+                for owner, owner_resolve in owners_by_file.owners[f]
+                if owner_resolve == resolve
+            ]
+            ancestor_owners = (init_owners, conftest_owners)
+            if shareable:
+                ancestor_owners_by_directory[ancestor_key] = ancestor_owners
+        init_owners, conftest_owners = ancestor_owners
+
+        inferred[address] = (InferredDependencies({*import_deps, *init_owners, *conftest_owners}),)
+
+    handled = tuple(tgt for tgt in candidates if tgt.address in inferred)
+    bulk = await resolve_dependencies_bulk(
+        BulkDependenciesRequest(
+            handled,
+            FrozenDict(inferred),
+            FrozenDict(
+                (tgt.address, explicit_by_address[tgt.address])
+                for tgt in handled
+                if tgt.address in explicit_by_address
+            ),
+        ),
+        **implicitly(),
+    )
+    return PeekBulkDependencies(bulk.dependencies)
+
+
 # This is a separate function to facilitate tests registering import inference.
 def import_rules():
     return [
         resolve_parsed_dependencies,
         parse_directory_python_dependencies,
+        get_python_source_owners_by_file,
         find_other_owners_for_unowned_import,
         infer_python_dependencies_via_source,
         *pex.rules(),
@@ -766,6 +1022,8 @@ def rules():
         get_python_source_owners_by_file,
         infer_python_init_dependencies,
         infer_python_conftest_dependencies,
+        get_python_peek_bulk_dependencies,
+        UnionRule(PeekBulkDependenciesRequest, PythonPeekBulkDependenciesRequest),
         *ancestor_files.rules(),
         UnionRule(InferDependenciesRequest, InferInitDependencies),
         UnionRule(InferDependenciesRequest, InferConftestDependencies),
