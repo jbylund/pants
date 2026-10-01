@@ -165,6 +165,10 @@ class StatsAggregatorCallback(WorkunitsCallback):
         # We need to finish synchronously for access to the console.
         return False
 
+    @property
+    def consumes_workunits(self) -> bool:
+        return False
+
     def _output_stats_in_plain_text(self, context: StreamingWorkunitContext):
         output_lines = []
         if self.output_file:
