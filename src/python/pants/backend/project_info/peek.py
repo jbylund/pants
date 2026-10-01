@@ -28,8 +28,7 @@ from pants.engine.internals.build_files import (
     get_dependencies_rule_application,
 )
 from pants.engine.internals.dep_rules import DependencyRuleApplication, DependencyRuleSet
-from pants.engine.internals.graph import hydrate_sources, resolve_targets
-from pants.engine.internals.specs_rules import find_valid_field_sets_for_target_roots
+from pants.engine.internals.graph import filter_targets, hydrate_sources, resolve_targets
 from pants.engine.rules import Rule, collect_rules, concurrently, goal_rule, implicitly, rule
 from pants.engine.target import (
     AlwaysTraverseDeps,
@@ -40,10 +39,8 @@ from pants.engine.target import (
     FieldSet,
     HydrateSourcesRequest,
     ImmutableValue,
-    NoApplicableTargetsBehavior,
     SourcesField,
     Target,
-    TargetRootsToFieldSetsRequest,
     UnexpandedTargets,
 )
 from pants.engine.unions import UnionMembership, union
@@ -92,7 +89,12 @@ class Peek(Goal):
     environment_behavior = Goal.EnvironmentBehavior.LOCAL_ONLY
 
 
+_SCALAR_TYPES = frozenset({str, int, float, bool, type(None), tuple})
+
+
 def _normalize_value(val: Any) -> Any:
+    if type(val) in _SCALAR_TYPES:
+        return val
     if isinstance(val, collections.abc.Mapping):
         return {str(k): _normalize_value(v) for k, v in val.items()}
     return val
@@ -142,9 +144,7 @@ class TargetData:
     def to_dict(self, exclude_defaults: bool = False, include_dep_rules: bool = False) -> dict:
         nothing = object()
         fields = {
-            (
-                f"{k.alias}_raw" if issubclass(k, (SourcesField, Dependencies)) else k.alias
-            ): _normalize_value(v.value)
+            _field_output_key(k): _normalize_value(v.value)
             for k, v in self.target.field_values.items()
             if not (exclude_defaults and getattr(k, "default", nothing) == v.value)
         }
@@ -175,6 +175,21 @@ class TargetData:
             "target_type": self.target.alias,
             **dict(sorted(fields.items())),
         }
+
+
+_FIELD_OUTPUT_KEYS: dict[type[Field], str] = {}
+
+
+def _field_output_key(field_type: type[Field]) -> str:
+    key = _FIELD_OUTPUT_KEYS.get(field_type)
+    if key is None:
+        key = (
+            f"{field_type.alias}_raw"
+            if issubclass(field_type, (SourcesField, Dependencies))
+            else field_type.alias
+        )
+        _FIELD_OUTPUT_KEYS[field_type] = key
+    return key
 
 
 class TargetDatas(Collection[TargetData]):
@@ -224,25 +239,20 @@ def describe_ruleset(ruleset: DependencyRuleSet | None) -> tuple[str, ...] | Non
     return ruleset.peek()
 
 
-async def _create_target_alias_to_goals_map() -> dict[str, tuple[str, ...]]:
+async def _create_target_alias_to_goals_map(
+    union_membership: UnionMembership,
+) -> dict[str, tuple[str, ...]]:
     """Returns a mapping from a target alias to the goals that can operate on that target.
 
     For instance, `pex_binary` would map to `("run", "package")`.
 
+    A goal is attributed to an alias if any target root of that type has an applicable
+    implementation of the goal's field set, which is what computing the field sets of every target
+    root for every goal would determine.
+
     :return: A mapping from a target alias to the goals that can operate on that target.
     """
     # This is manually curated for now - we'll have to use it a bit to determine if we want to show all goals or not
-    peekable_field_sets: list[type[FieldSet]] = [
-        DeployFieldSet,
-        PackageFieldSet,
-        PublishFieldSet,
-        RunFieldSet,
-        TestFieldSet,
-    ]
-
-    # Goal holds a GoalSubsystem which has the name we care about, and it's exposed via a classmethod on Goal
-    # There is no tightly coupled relationship between a Goal/GoalSubsystem and the associated FieldSet
-    # This gets murkier with Fix/Fmt/Lint/etc... So, we'll just manually map them for now
     field_set_to_goal_map: dict[type[FieldSet], str] = {
         DeployFieldSet: Deploy.name,
         PackageFieldSet: Package.name,
@@ -251,38 +261,24 @@ async def _create_target_alias_to_goals_map() -> dict[str, tuple[str, ...]]:
         TestFieldSet: Test.name,
     }
 
-    assert len(peekable_field_sets) == len(field_set_to_goal_map), (
-        "Must have a goal string for each field set"
-    )
-    peekable_goals = [field_set_to_goal_map[fs] for fs in peekable_field_sets]
+    targets = await filter_targets(**implicitly())
+    targets_by_type: dict[type[Target], list[Target]] = collections.defaultdict(list)
+    for tgt in targets:
+        targets_by_type[type(tgt)].append(tgt)
 
-    target_roots_to_field_sets_get = [
-        find_valid_field_sets_for_target_roots(
-            TargetRootsToFieldSetsRequest(
-                field_set_superclass=fs,
-                goal_description="",
-                no_applicable_targets_behavior=NoApplicableTargetsBehavior.ignore,
-            ),
-            **implicitly(),
-        )
-        for fs in peekable_field_sets
-    ]
-
-    target_roots_to_field_sets = await concurrently(target_roots_to_field_sets_get)
-
-    # Create a collection of target aliases per target roots: e.g. [frozenset(), frozenset({'pyoxidizer_binary', 'pex_binary'}), ...]
-    aliases_per_target_root: Iterable[frozenset[str]] = [
-        frozenset(tgt.alias for tgt in tgt_root.targets) for tgt_root in target_roots_to_field_sets
-    ]
-
-    # Create a mapping from the goal name to a collection of target aliases: e.g. {'run': frozenset({'pyoxidizer_binary', 'pex_binary'}), 'test': frozenset(), ...}
-    goal_to_aliases_map = dict(zip(peekable_goals, aliases_per_target_root))
-
-    # Inverse the goal_to_aliases_map to create a mapping from a target alias to a collection of goal names: e.g. {'pyoxidizer_binary': frozenset({'package', 'run'}), 'pex_binary': frozenset({'package', 'run'}), ...}
     alias_to_goals_map: dict[str, set[str]] = {}
-    for goal, aliases in goal_to_aliases_map.items():
-        for alias in aliases:
-            alias_to_goals_map.setdefault(alias, set()).add(goal)
+    for field_set_superclass, goal in field_set_to_goal_map.items():
+        implementations = union_membership.get(field_set_superclass)
+        for tgt_type, tgts in targets_by_type.items():
+            candidates = [
+                implementation
+                for implementation in implementations
+                if tgt_type.class_has_fields(implementation.required_fields, union_membership)
+            ]
+            if candidates and any(
+                implementation.is_applicable(tgt) for tgt in tgts for implementation in candidates
+            ):
+                alias_to_goals_map.setdefault(tgt_type.alias, set()).add(goal)
 
     # Convert the goal sets to tuples for JSON serialization
     return {alias: tuple(sorted(goals)) for alias, goals in alias_to_goals_map.items()}
@@ -426,6 +422,7 @@ async def peek(
     console: Console,
     subsys: PeekSubsystem,
     targets: UnexpandedTargets,
+    union_membership: UnionMembership,
 ) -> Peek:
     """Display detailed target information in JSON form.
 
@@ -437,7 +434,7 @@ async def peek(
 
     tds = await get_target_data(targets, **implicitly())
     # This method needs to be called in a @goal_rule, otherwise it fails out with Rule errors (when called in an @rule)
-    target_alias_to_goals_map = await _create_target_alias_to_goals_map()
+    target_alias_to_goals_map = await _create_target_alias_to_goals_map(union_membership)
 
     if target_alias_to_goals_map:
         # Attach the goals to the target data, in the hopes that we can pull `_create_target_alias_to_goals_map` back into `get_target_data`
