@@ -34,7 +34,7 @@ from pants.engine.internals.build_files import (
     parse_address_family,
     resolve_address,
 )
-from pants.engine.internals.mapper import AddressFamilies, SpecsFilter
+from pants.engine.internals.mapper import AddressFamilies, AddressFamily, SpecsFilter
 from pants.engine.internals.native_engine import AddressParseException
 from pants.engine.internals.parametrize import Parametrize, _TargetParametrization
 from pants.engine.internals.parametrize import (  # noqa: F401
@@ -53,6 +53,12 @@ from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import (
     AllTargets,
     AllUnexpandedTargets,
+    AlwaysTraverseDeps,
+    BulkDependencies,
+    BulkDependenciesRequest,
+    BulkInferDependenciesRequest,
+    BulkInferredDependencies,
+    BulkValidateDependenciesRequest,
     CoarsenedTarget,
     CoarsenedTargets,
     CoarsenedTargetsRequest,
@@ -236,12 +242,14 @@ async def _parametrized_target_generators_with_templates(
     target_type: type[TargetGenerator],
     generator_fields: dict[str, Any],
     union_membership: UnionMembership,
+    family: AddressFamily | None = None,
 ) -> list[tuple[TargetGenerator, Mapping[str, Any]]]:
     # Pre-load field values from defaults for the target type being generated.
     if hasattr(target_type, "generated_target_cls"):
-        family = (
-            await parse_address_family(**implicitly(AddressFamilyDir(address.spec_path)))
-        ).ensure()
+        if family is None:
+            family = (
+                await parse_address_family(**implicitly(AddressFamilyDir(address.spec_path)))
+            ).ensure()
         template_fields = dict(family.defaults.get(target_type.generated_target_cls.alias, {}))
     else:
         template_fields = {}
@@ -330,8 +338,10 @@ async def _target_generator_overrides(
         override_globs = OverridesField.to_path_globs(
             address, overrides_flattened, unmatched_build_file_globs
         )
-        override_paths = await concurrently(
-            path_globs_to_paths(path_globs) for path_globs in override_globs
+        override_paths = (
+            await concurrently(path_globs_to_paths(path_globs) for path_globs in override_globs)
+            if override_globs
+            else ()
         )
         return OverridesField.flatten_paths(
             address, zip(override_paths, override_globs, overrides_flattened.values())
@@ -345,6 +355,7 @@ async def _generator_target_requests(
     union_membership: UnionMembership,
     target_types_to_generate_requests: TargetTypesToGenerateTargetsRequests,
     unmatched_build_file_globs: UnmatchedBuildFileGlobs,
+    family: AddressFamily | None = None,
 ) -> ResolvedTargetGeneratorRequests:
     target_adaptor = adaptor_and_type.adaptor
     target_type = adaptor_and_type.target_type
@@ -361,6 +372,7 @@ async def _generator_target_requests(
         target_type,
         generator_fields,
         union_membership,
+        family,
     )
     # The overrides depend only on the generator's address and fields.
     base_generator = (
@@ -493,6 +505,7 @@ async def resolve_target_parametrizations(
             union_membership,
             target_types_to_generate_requests,
             unmatched_build_file_globs,
+            address_family,
         )
     if requests and requests.requests:
         all_generated = await concurrently(
@@ -761,6 +774,59 @@ async def resolve_targets(
         for tgt in parametrizations.generated_or_generator(generator.address)
     )
     return Targets(expanded_targets)
+
+
+async def expand_targets_in_bulk(
+    targets_per_key: Mapping[Address, Sequence[Target]],
+    target_types_to_generate_requests: TargetTypesToGenerateTargetsRequests,
+    local_environment_name: ChosenLocalEnvironmentName,
+) -> dict[Address, tuple[Target, ...]]:
+    """Expand each sequence of (unexpanded) targets as `resolve_targets` does."""
+
+    def is_generator(tgt: Target) -> bool:
+        return (
+            target_types_to_generate_requests.is_generator(tgt)
+            and not tgt.address.is_generated_target
+        )
+
+    generators = list(
+        dict.fromkeys(
+            tgt.address for tgts in targets_per_key.values() for tgt in tgts if is_generator(tgt)
+        )
+    )
+    all_parametrizations = await concurrently(
+        resolve_target_parametrizations(
+            **implicitly(
+                {
+                    _TargetParametrizationsRequest(
+                        address.maybe_convert_to_target_generator(),
+                        description_of_origin="<infallible>",
+                    ): _TargetParametrizationsRequest,
+                    local_environment_name.val: EnvironmentName,
+                }
+            )
+        )
+        for address in generators
+    )
+    parametrizations_by_address = dict(zip(generators, all_parametrizations))
+    expanded_per_key = {}
+    for key, tgts in targets_per_key.items():
+        expanded: OrderedSet[Target] = OrderedSet()
+        generator_targets = []
+        for tgt in tgts:
+            if is_generator(tgt):
+                generator_targets.append(tgt)
+            else:
+                expanded.add(tgt)
+        expanded.update(
+            generated
+            for generator in generator_targets
+            for generated in parametrizations_by_address[generator.address].generated_or_generator(
+                generator.address
+            )
+        )
+        expanded_per_key[key] = tuple(expanded)
+    return expanded_per_key
 
 
 @rule(desc="Find all targets in the project", level=LogLevel.DEBUG, _masked_types=[EnvironmentName])
@@ -1696,16 +1762,22 @@ async def determine_explicitly_provided_dependencies(
         else:
             addresses.append(result)
 
-    parsed_includes = await concurrently(
-        resolve_address(**implicitly({ai: AddressInput})) for ai in addresses
+    if not addresses and not ignored_addresses:
+        return ExplicitlyProvidedDependencies(
+            request.field.address, FrozenOrderedSet(), FrozenOrderedSet()
+        )
+    maybe_addresses = await concurrently(
+        maybe_resolve_address(ai) for ai in (*addresses, *ignored_addresses)
     )
-    parsed_ignores = await concurrently(
-        resolve_address(**implicitly({ai: AddressInput})) for ai in ignored_addresses
-    )
+    resolved = []
+    for maybe_address in maybe_addresses:
+        if isinstance(maybe_address.val, ResolveError):
+            raise maybe_address.val
+        resolved.append(maybe_address.val)
     return ExplicitlyProvidedDependencies(
         request.field.address,
-        FrozenOrderedSet(sorted(parsed_includes)),
-        FrozenOrderedSet(sorted(parsed_ignores)),
+        FrozenOrderedSet(sorted(resolved[: len(addresses)])),
+        FrozenOrderedSet(sorted(resolved[len(addresses) :])),
     )
 
 
@@ -1756,6 +1828,322 @@ async def validate_dependencies(
     environment_name: EnvironmentName,
 ) -> ValidatedDependencies:
     raise NotImplementedError()
+
+
+@rule(polymorphic=True)
+async def bulk_validate_dependencies(
+    request: BulkValidateDependenciesRequest,
+    environment_name: EnvironmentName,
+) -> ValidatedDependencies:
+    raise NotImplementedError()
+
+
+async def validate_dependencies_of_targets(
+    targets_and_dependencies: Iterable[tuple[Target, Addresses]],
+    union_membership: UnionMembership,
+    environment_name: EnvironmentName,
+) -> None:
+    """Validate the dependencies of each target as `resolve_dependencies` does, in bulk for the
+    validations which support it."""
+    bulk_request_types = {
+        bulk_request_type.validates: bulk_request_type
+        for bulk_request_type in union_membership.get(BulkValidateDependenciesRequest)
+    }
+    bulk: dict[type[ValidateDependenciesRequest], list[tuple[Target, Addresses]]] = defaultdict(
+        list
+    )
+    individual = []
+    for tgt, dependencies in targets_and_dependencies:
+        for vd_request_type in union_membership.get(ValidateDependenciesRequest):
+            if not vd_request_type.field_set_type.is_applicable(tgt):  # type: ignore[misc]
+                continue
+            if vd_request_type in bulk_request_types:
+                bulk[vd_request_type].append((tgt, dependencies))
+            else:
+                individual.append(
+                    vd_request_type(
+                        vd_request_type.field_set_type.create(tgt),  # type: ignore[misc]
+                        dependencies,
+                    )
+                )
+    await concurrently(
+        *(
+            bulk_validate_dependencies(
+                **implicitly(
+                    {
+                        bulk_request_types[vd_request_type](
+                            tuple(pairs)
+                        ): BulkValidateDependenciesRequest,
+                        environment_name: EnvironmentName,
+                    }
+                )
+            )
+            for vd_request_type, pairs in bulk.items()
+        ),
+        *(
+            validate_dependencies(
+                **implicitly(
+                    {
+                        vd_request: ValidateDependenciesRequest,
+                        environment_name: EnvironmentName,
+                    }
+                )
+            )
+            for vd_request in individual
+        ),
+    )
+
+
+@rule(polymorphic=True)
+async def infer_dependencies_bulk(
+    request: BulkInferDependenciesRequest,
+    environment_name: EnvironmentName,
+) -> BulkInferredDependencies:
+    raise NotImplementedError()
+
+
+async def _infer_dependencies_of_targets(
+    inference_request_type: type[InferDependenciesRequest],
+    targets: Sequence[Target],
+    bulk_request_type: type[BulkInferDependenciesRequest] | None,
+    environment_name: EnvironmentName,
+) -> tuple[InferredDependencies, ...]:
+    """Run one kind of dependency inference for each target: in bulk where supported."""
+    in_bulk: Mapping[Address, InferredDependencies] = {}
+    if bulk_request_type is not None:
+        in_bulk = (
+            await infer_dependencies_bulk(
+                **implicitly(
+                    {
+                        bulk_request_type(
+                            tuple(inference_request_type.infer_from.create(tgt) for tgt in targets)
+                        ): BulkInferDependenciesRequest,
+                        environment_name: EnvironmentName,
+                    }
+                )
+            )
+        ).dependencies
+    individually = [tgt for tgt in targets if tgt.address not in in_bulk]
+    individual_results = dict(
+        zip(
+            (tgt.address for tgt in individually),
+            await concurrently(
+                infer_dependencies(
+                    **implicitly(
+                        {
+                            inference_request_type(
+                                inference_request_type.infer_from.create(tgt)
+                            ): InferDependenciesRequest,
+                            environment_name: EnvironmentName,
+                        },
+                    )
+                )
+                for tgt in individually
+            ),
+        )
+    )
+    return tuple(
+        in_bulk[tgt.address] if tgt.address in in_bulk else individual_results[tgt.address]
+        for tgt in targets
+    )
+
+
+@rule(_masked_types=[EnvironmentName])
+async def resolve_dependencies_bulk(
+    request: BulkDependenciesRequest,
+    target_types_to_generate_requests: TargetTypesToGenerateTargetsRequests,
+    union_membership: UnionMembership,
+    subproject_roots: SubprojectRoots,
+    field_defaults: FieldDefaults,
+    local_environment_name: ChosenLocalEnvironmentName,
+) -> BulkDependencies:
+    """Equivalent to `resolve_dependencies` for each target, with each step batched."""
+    environment_name = local_environment_name.val
+    predicate = AlwaysTraverseDeps()
+    targets = request.targets
+    with_explicit = [
+        tgt
+        for tgt in targets
+        if tgt.get(Dependencies).value and tgt.address not in request.explicit
+    ]
+    generators = [
+        tgt
+        for tgt in targets
+        if target_types_to_generate_requests.is_generator(tgt)
+        and not tgt.address.is_generated_target
+    ]
+    special_cased = [
+        (tgt, special_cased_field, addr)
+        for tgt in targets
+        for special_cased_field in tgt.field_values.values()
+        if isinstance(special_cased_field, SpecialCasedDependencies)
+        and predicate(tgt, special_cased_field) == DepsTraversalBehavior.INCLUDE
+        for addr in special_cased_field.to_unparsed_address_inputs().values
+    ]
+    inference_request_types = union_membership.get(InferDependenciesRequest)
+    bulk_inference_request_types = {
+        bulk_request_type.infers: bulk_request_type
+        for bulk_request_type in union_membership.get(BulkInferDependenciesRequest)
+    }
+    # Grouped by type, each group with its own bound on in-flight requests, so that one slow kind
+    # of inference (e.g. one waiting on a JDK download) cannot monopolize them.
+    to_infer_by_type: dict[type[InferDependenciesRequest], list[Target]] = defaultdict(list)
+    if request.inference_types is not None:
+        to_infer = [tgt for tgt in targets if tgt.address not in request.inferred]
+        if to_infer:
+            for inference_request_type in request.inference_types:
+                to_infer_by_type[inference_request_type] = to_infer
+    else:
+        for tgt in targets:
+            if tgt.address in request.inferred:
+                continue
+            for inference_request_type in inference_request_types:
+                if inference_request_type.infer_from.is_applicable(tgt):
+                    to_infer_by_type[inference_request_type].append(tgt)
+    try:
+        (
+            explicit_results,
+            generator_parametrizations,
+            special_cased_addresses,
+            inference_results,
+        ) = await concurrently(
+            concurrently(
+                determine_explicitly_provided_dependencies(
+                    ExplicitlyProvidedDependenciesRequest(tgt.get(Dependencies)), **implicitly()
+                )
+                for tgt in with_explicit
+            ),
+            concurrently(
+                resolve_target_parametrizations(
+                    **implicitly(
+                        {
+                            _TargetParametrizationsRequest(
+                                tgt.address.maybe_convert_to_target_generator(),
+                                description_of_origin=(
+                                    f"the target generator {tgt.address.maybe_convert_to_target_generator()}"
+                                ),
+                            ): _TargetParametrizationsRequest,
+                            environment_name: EnvironmentName,
+                        }
+                    )
+                )
+                for tgt in generators
+            ),
+            concurrently(
+                resolve_address(
+                    **implicitly(
+                        {
+                            AddressInput.parse(
+                                addr,
+                                relative_to=tgt.address.spec_path,
+                                subproject_roots=subproject_roots,
+                                description_of_origin=(
+                                    f"the `{special_cased_field.alias}` field from the target {tgt.address}"
+                                ),
+                            ): AddressInput
+                        }
+                    )
+                )
+                for tgt, special_cased_field, addr in special_cased
+            ),
+            concurrently(
+                _infer_dependencies_of_targets(
+                    inference_request_type,
+                    tgts,
+                    bulk_inference_request_types.get(inference_request_type),
+                    environment_name,
+                )
+                for inference_request_type, tgts in to_infer_by_type.items()
+            ),
+        )
+        explicit_by_address = {
+            **request.explicit,
+            **{tgt.address: explicit for tgt, explicit in zip(with_explicit, explicit_results)},
+        }
+        # Fill in the parameters of explicitly provided dependencies, as `_fill_parameters` does.
+        fill_requests = [
+            (tgt, addr)
+            for tgt in targets
+            if tgt.address in explicit_by_address
+            for addr in (
+                *explicit_by_address[tgt.address].includes,
+                *explicit_by_address[tgt.address].ignores,
+            )
+        ]
+        # One lookup per target (generator) address; the description only appears in errors, which
+        # the per-target path reports.
+        fill_bases: dict[Address, tuple[Target, Address]] = {}
+        for tgt, addr in fill_requests:
+            fill_bases.setdefault(addr.maybe_convert_to_target_generator(), (tgt, addr))
+        fill_parametrizations = await concurrently(
+            resolve_target_parametrizations(
+                **implicitly(
+                    {
+                        _TargetParametrizationsRequest(
+                            base,
+                            description_of_origin=(
+                                f"the `{tgt.get(Dependencies).alias}` field of the target {tgt.address}"
+                            ),
+                        ): _TargetParametrizationsRequest,
+                        environment_name: EnvironmentName,
+                    }
+                )
+            )
+            for base, (tgt, _) in fill_bases.items()
+        )
+        parametrizations_by_base = dict(zip(fill_bases, fill_parametrizations))
+        filled = {
+            (tgt.address, addr): parametrizations_by_base[addr.maybe_convert_to_target_generator()]
+            .get_subset(addr, tgt, field_defaults, target_types_to_generate_requests)
+            .address
+            for tgt, addr in fill_requests
+        }
+    except Exception:
+        return BulkDependencies(FrozenDict())
+
+    generated_by_address = {
+        tgt.address: tuple(parametrizations.generated_for(tgt.address).keys())
+        for tgt, parametrizations in zip(generators, generator_parametrizations)
+    }
+    special_cased_by_address: dict[Address, list[Address]] = defaultdict(list)
+    for (tgt, _, _), special_cased_address in zip(special_cased, special_cased_addresses):
+        special_cased_by_address[tgt.address].append(special_cased_address)
+    inferred_by_address: dict[Address, list[InferredDependencies]] = defaultdict(list)
+    for tgts, results_for_type in zip(to_infer_by_type.values(), inference_results):
+        for tgt, inferred_dependencies in zip(tgts, results_for_type):
+            inferred_by_address[tgt.address].append(inferred_dependencies)
+
+    results: dict[Address, Addresses] = {}
+    for tgt in targets:
+        address = tgt.address
+        explicit = explicit_by_address.get(address)
+        includes = tuple(filled[(address, addr)] for addr in explicit.includes) if explicit else ()
+        ignores: FrozenOrderedSet[Address] = (
+            FrozenOrderedSet(filled[(address, addr)] for addr in explicit.ignores)
+            if explicit
+            else FrozenOrderedSet()
+        )
+        inferred = request.inferred.get(address) or inferred_by_address.get(address, ())
+        excluded = ignores.union(*itertools.chain(deps.exclude for deps in inferred))
+        results[address] = Addresses(
+            sorted(
+                {
+                    addr
+                    for addr in (
+                        *generated_by_address.get(address, ()),
+                        *includes,
+                        *itertools.chain.from_iterable(deps.include for deps in inferred),
+                        *special_cased_by_address.get(address, ()),
+                    )
+                    if addr not in excluded
+                }
+            )
+        )
+
+    await validate_dependencies_of_targets(
+        ((tgt, results[tgt.address]) for tgt in targets), union_membership, environment_name
+    )
+    return BulkDependencies(FrozenDict(results))
 
 
 @rule(desc="Resolve direct dependencies of target", _masked_types=[EnvironmentName])
