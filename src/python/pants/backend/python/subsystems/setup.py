@@ -1044,7 +1044,9 @@ class PythonSetup(Subsystem):
         If interpreter constraints are supplied by the CLI flag, return those only.
         """
         # A function of the options, which are fixed for this instance.
-        cache = self.__dict__.setdefault("_compatibility_or_constraints_cache", {})
+        cache: dict[tuple[tuple[str, ...] | None, str | None], tuple[str, ...]] = (
+            self.__dict__.setdefault("_compatibility_or_constraints_cache", {})
+        )
         key = (tuple(compatibility) if compatibility else None, resolve)
         result = cache.get(key)
         if result is None:
