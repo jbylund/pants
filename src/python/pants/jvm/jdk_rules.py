@@ -19,7 +19,7 @@ from pants.core.util_rules.system_binaries import BashBinary, LnBinary
 from pants.engine.fs import CreateDigest, Digest, FileContent, MergeDigests
 from pants.engine.intrinsics import create_digest, execute_process, merge_digests
 from pants.engine.process import Process, ProcessCacheScope
-from pants.engine.rules import concurrently, collect_rules, implicitly, rule
+from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import CoarsenedTarget
 from pants.jvm.compile import ClasspathEntry
 from pants.jvm.resolve.coordinate import Coordinates
@@ -252,20 +252,20 @@ async def prepare_jdk_environment(
     # The nailgun jar is only needed to assemble the environment: fetch it while the JDK downloads.
     java_version_result, nailgun_ = await concurrently(
         execute_process(
-        Process(
-            argv=(
-                bash.path,
-                "-c",
-                f"$({java_home_command})/bin/java -version",
+            Process(
+                argv=(
+                    bash.path,
+                    "-c",
+                    f"$({java_home_command})/bin/java -version",
+                ),
+                append_only_caches=coursier.append_only_caches,
+                immutable_input_digests=coursier.immutable_input_digests,
+                env=env,
+                description=f"Ensure download of JDK {coursier_jdk_option}.",
+                cache_scope=env_target.executable_search_path_cache_scope(),
+                level=LogLevel.DEBUG,
             ),
-            append_only_caches=coursier.append_only_caches,
-            immutable_input_digests=coursier.immutable_input_digests,
-            env=env,
-            description=f"Ensure download of JDK {coursier_jdk_option}.",
-            cache_scope=env_target.executable_search_path_cache_scope(),
-            level=LogLevel.DEBUG,
-        ),
-        **implicitly(),
+            **implicitly(),
         ),
         fetch_nailgun(**implicitly()),
     )

@@ -324,7 +324,9 @@ class BuildFileVisibilityRules(BuildFileDependencyRules):
         key = (id(ruleset), other_address, relpath)
         cached = cache.get(key)
         if cached is not None and cached[0] is other_adaptor:
-            return cached[1]
+            return cast(
+                tuple[VisibilityRuleSet | None, DependencyRuleAction | None, str | None], cached[1]
+            )
         result = self._get_action_uncached(
             ruleset, address, adaptor, relpath, other_address, other_adaptor
         )
@@ -373,7 +375,7 @@ class BuildFileVisibilityRules(BuildFileDependencyRules):
         key = (address, relpath)
         cached = cache.get(key)
         if cached is not None and cached[0] is target:
-            return cached[1]
+            return cast(VisibilityRuleSet | None, cached[1])
         result = next(
             (ruleset for ruleset in self.rulesets if ruleset.match(address, target, relpath)), None
         )
