@@ -7,6 +7,7 @@ import collections
 import collections.abc
 import json
 import logging
+import sys
 from abc import ABCMeta
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, fields, is_dataclass, replace
@@ -20,7 +21,7 @@ from pants.core.goals.test import Test, TestFieldSet
 from pants.engine.addresses import Address, Addresses
 from pants.engine.collection import Collection
 from pants.engine.console import Console
-from pants.engine.environment import EnvironmentName
+from pants.engine.environment import ChosenLocalEnvironmentName, EnvironmentName
 from pants.engine.fs import PathGlobsBatch, Snapshot
 from pants.engine.goal import Goal, GoalSubsystem, Outputting
 from pants.engine.internals.build_files import (
@@ -28,20 +29,31 @@ from pants.engine.internals.build_files import (
     get_dependencies_rule_application,
 )
 from pants.engine.internals.dep_rules import DependencyRuleApplication, DependencyRuleSet
-from pants.engine.internals.graph import filter_targets, resolve_targets
+from pants.engine.internals.graph import (
+    expand_targets_in_bulk,
+    filter_targets,
+    hydrate_sources,
+    resolve_dependencies_bulk,
+    resolve_targets,
+)
 from pants.engine.intrinsics import path_globs_to_snapshots
 from pants.engine.rules import Rule, collect_rules, concurrently, goal_rule, implicitly, rule
 from pants.engine.target import (
     AlwaysTraverseDeps,
+    BulkDependenciesRequest,
     Dependencies,
     DependenciesRequest,
     DependenciesRuleApplicationRequest,
     Field,
     FieldSet,
     ImmutableValue,
+    InferDependenciesRequest,
     SourcesField,
     Target,
+    Targets,
+    TargetTypesToGenerateTargetsRequests,
     UnexpandedTargets,
+    applicable_field_set_types,
 )
 from pants.engine.unions import UnionMembership, union
 from pants.option.bootstrap_options import UnmatchedBuildFileGlobs
@@ -108,6 +120,41 @@ class HasAdditionalTargetDataFieldSet(FieldSet, metaclass=ABCMeta):
     the output of `pants peek` if the `--peek-include-additional-info` option is enabled."""
 
 
+@union(in_scope_types=[EnvironmentName])
+@dataclass(frozen=True)
+class PeekBulkDependenciesRequest:
+    """A backend may compute the direct dependencies of many targets at once for `peek`.
+
+    Implementations return, for each target they handle, exactly the `Addresses` which resolving a
+    `DependenciesRequest` (always traversing) for it would, with dependency validation applied.
+    Targets which an implementation does not handle are resolved individually. `targets` are always
+    among the implementation's `candidates`.
+    """
+
+    targets: tuple[Target, ...]
+
+    @classmethod
+    def candidates(
+        cls, targets: Iterable[Target], union_membership: UnionMembership
+    ) -> tuple[Target, ...]:
+        """The targets this implementation may handle, which are then not resolved individually
+        unless it declines them.
+
+        Must be cheap: it runs before any dependency resolution starts.
+        """
+        return ()
+
+
+@dataclass(frozen=True)
+class PeekBulkDependencies:
+    dependencies: FrozenDict[Address, Addresses]
+
+
+@rule(polymorphic=True)
+async def get_peek_bulk_dependencies(request: PeekBulkDependenciesRequest) -> PeekBulkDependencies:
+    raise NotImplementedError()
+
+
 @dataclass(frozen=True)
 class AdditionalTargetData:
     label: str
@@ -129,6 +176,13 @@ async def get_additional_target_data(
     raise NotImplementedError()
 
 
+class _Unset:
+    pass
+
+
+_UNSET = _Unset()
+
+
 @dataclass(frozen=True)
 class TargetData:
     target: Target
@@ -142,13 +196,24 @@ class TargetData:
     goals: tuple[str, ...] | None = None
     additional_info: tuple[AdditionalTargetData, ...] | None = None
 
-    def to_dict(self, exclude_defaults: bool = False, include_dep_rules: bool = False) -> dict:
+    def to_dict(
+        self,
+        exclude_defaults: bool = False,
+        include_dep_rules: bool = False,
+        goals: tuple[str, ...] | None | _Unset = _UNSET,
+    ) -> dict:
+        """The target data as a JSON-compatible dict, with `goals` in place of `self.goals` if
+        given."""
         nothing = object()
-        fields = {
-            _field_output_key(k): _normalize_value(v.value)
-            for k, v in self.target.field_values.items()
-            if not (exclude_defaults and getattr(k, "default", nothing) == v.value)
-        }
+        fields = {}
+        for k, v in self.target.field_values.items():
+            value = v.value
+            if exclude_defaults and getattr(k, "default", nothing) == value:
+                continue
+            key = _FIELD_OUTPUT_KEYS.get(k)
+            if key is None:
+                key = _field_output_key(k)
+            fields[key] = value if type(value) in _SCALAR_TYPES else _normalize_value(value)
 
         fields["dependencies"] = self.expanded_dependencies
         if self.expanded_sources is not None:
@@ -160,8 +225,10 @@ class TargetData:
             fields["_dependents_rules"] = self.dependents_rules
             fields["_applicable_dep_rules"] = self.applicable_dep_rules
 
-        if self.goals is not None:
-            fields["goals"] = self.goals
+        if goals is _UNSET:
+            goals = self.goals
+        if goals is not None:
+            fields["goals"] = goals
 
         if self.additional_info is not None:
             fields["additional_info"] = {
@@ -171,11 +238,27 @@ class TargetData:
                 )
             }
 
-        return {
+        result = {
             "address": self.target.address.spec,
             "target_type": self.target.alias,
-            **dict(sorted(fields.items())),
         }
+        result.update(sorted(fields.items()))
+        return result
+
+
+_FIELD_OUTPUT_KEYS: dict[type[Field], str] = {}
+
+
+def _field_output_key(field_type: type[Field]) -> str:
+    key = _FIELD_OUTPUT_KEYS.get(field_type)
+    if key is None:
+        key = (
+            f"{field_type.alias}_raw"
+            if issubclass(field_type, (SourcesField, Dependencies))
+            else field_type.alias
+        )
+        _FIELD_OUTPUT_KEYS[field_type] = key
+    return key
 
 
 _FIELD_OUTPUT_KEYS: dict[type[Field], str] = {}
@@ -198,9 +281,24 @@ class TargetDatas(Collection[TargetData]):
 
 
 def render_json(
-    tds: Iterable[TargetData], exclude_defaults: bool = False, include_dep_rules: bool = False
+    tds: Iterable[TargetData],
+    exclude_defaults: bool = False,
+    include_dep_rules: bool = False,
+    *,
+    goals_by_alias: Mapping[str, tuple[str, ...]] | None = None,
 ) -> str:
-    return f"{json.dumps([td.to_dict(exclude_defaults, include_dep_rules) for td in tds], indent=2, cls=_PeekJsonEncoder)}\n"
+    """Renders the target data, with the goals of each target taken from `goals_by_alias` if
+    given (as if each `TargetData` had its `goals` set from it)."""
+    if goals_by_alias is None:
+        dicts = [td.to_dict(exclude_defaults, include_dep_rules) for td in tds]
+    else:
+        dicts = [
+            td.to_dict(
+                exclude_defaults, include_dep_rules, goals=goals_by_alias.get(td.target.alias)
+            )
+            for td in tds
+        ]
+    return f"{json.dumps(dicts, indent=2, cls=_PeekJsonEncoder)}\n"
 
 
 class _PeekJsonEncoder(json.JSONEncoder):
@@ -290,6 +388,8 @@ async def get_target_data(
     targets: UnexpandedTargets,
     subsys: PeekSubsystem,
     union_membership: UnionMembership,
+    target_types_to_generate_requests: TargetTypesToGenerateTargetsRequests,
+    local_environment_name: ChosenLocalEnvironmentName,
     unmatched_build_file_globs: UnmatchedBuildFileGlobs,
 ) -> TargetDatas:
     """Given a set of unexpanded targets, return a mapping of target addresses to their data.
@@ -308,31 +408,176 @@ async def get_target_data(
     # We "hydrate" sources fields with the engine, but not every target has them registered.
     targets_with_sources = [tgt for tgt in sorted_targets if tgt.has_field(SourcesField)]
 
+    # Dependency rules are described in terms of the dependency targets, which bulk
+    # implementations do not produce.
+    bulk_request_types = (
+        () if subsys.include_dep_rules else union_membership.get(PeekBulkDependenciesRequest)
+    )
+    bulk_candidates: set[Address] = set()
+    bulk_requests = []
+    for request_type in bulk_request_types:
+        candidates = tuple(
+            tgt
+            for tgt in request_type.candidates(sorted_targets, union_membership)
+            if tgt.address not in bulk_candidates
+        )
+        bulk_candidates.update(tgt.address for tgt in candidates)
+        if candidates:
+            bulk_requests.append(request_type(candidates))
+
+    # Other targets are resolved in bulk generically, running their dependency inference.
+    generic_candidates = (
+        ()
+        if subsys.include_dep_rules
+        else tuple(tgt for tgt in sorted_targets if tgt.address not in bulk_candidates)
+    )
+    bulk_candidates.update(tgt.address for tgt in generic_candidates)
+    # Resolved in groups by the kinds of inference that apply, so that targets with fast (or no)
+    # inference need not wait for targets whose inference is slow (e.g. runs JVM processes).
+    inference_request_types = union_membership.get(InferDependenciesRequest)
+    generic_groups: dict[tuple[type[InferDependenciesRequest], ...], list[Target]] = (
+        collections.defaultdict(list)
+    )
+    inference_field_set_types = tuple(
+        inference_request_type.infer_from for inference_request_type in inference_request_types
+    )
+    for tgt in generic_candidates:
+        applicable = set(applicable_field_set_types(inference_field_set_types, tgt))
+        generic_groups[
+            tuple(
+                inference_request_type
+                for inference_request_type in inference_request_types
+                if inference_request_type.infer_from in applicable
+            )
+        ].append(tgt)
+
     # When determining dependencies, we replace target generators with their generated targets.
-    # Sources are hydrated at the same time, since neither depends on the other. Hydrating a
-    # sources field without codegen is snapshotting its globs, so all are snapshotted in one batch.
-    dependencies_per_target, sources_snapshots = await concurrently(
+    # The requests are grouped by target type, each group with its own bound on in-flight
+    # requests, so that one slow kind of target (e.g. JVM targets waiting on a JDK download) cannot
+    # monopolize them. Within a group, sorted order keeps neighbouring targets together.
+    indices_by_type: dict[type[Target], list[int]] = collections.defaultdict(list)
+    for i, tgt in enumerate(sorted_targets):
+        if tgt.address not in bulk_candidates:
+            indices_by_type[type(tgt)].append(i)
+    (
+        bulk_results,
+        generic_results,
+        dependencies_per_type,
+        expanded_sources_map,
+    ) = await concurrently(
+        concurrently(
+                get_peek_bulk_dependencies(
+                    **implicitly({bulk_request: PeekBulkDependenciesRequest})
+                )
+                for bulk_request in bulk_requests
+            ),
+        concurrently(
+                resolve_dependencies_bulk(
+                    BulkDependenciesRequest(
+                        tuple(group), FrozenDict(), inference_types=inference_types
+                    ),
+                    **implicitly(),
+                )
+                for inference_types, group in generic_groups.items()
+            ),
+        concurrently(
+                concurrently(
+                    resolve_targets(
+                        **implicitly(
+                            DependenciesRequest(
+                                sorted_targets[i].get(Dependencies),
+                                should_traverse_deps_predicate=AlwaysTraverseDeps(),
+                            )
+                        )
+                    )
+                    for i in indices
+                )
+                for indices in indices_by_type.values()
+            ),
+        # Hydrating a sources field without codegen is snapshotting its globs, so all are
+        # snapshotted at once.
+        _validated_sources(
+                targets_with_sources,
+                path_globs_to_snapshots(
+                    PathGlobsBatch(
+                        tuple(
+                            tgt[SourcesField].path_globs(unmatched_build_file_globs)
+                            for tgt in targets_with_sources
+                        )
+                    )
+                ),
+            ),
+    )
+    dependencies_per_target: list[Targets] = [Targets()] * len(sorted_targets)
+    for indices, deps_for_type in zip(indices_by_type.values(), dependencies_per_type):
+        for i, deps in zip(indices, deps_for_type):
+            dependencies_per_target[i] = deps
+
+    generic_dependencies: dict[Address, Addresses] = {}
+    for generic_result in generic_results:
+        generic_dependencies.update(generic_result.dependencies)
+    unexpanded_bulk_dependencies: dict[Address, Addresses] = dict(generic_dependencies)
+    for bulk_result in bulk_results:
+        unexpanded_bulk_dependencies.update(bulk_result.dependencies)
+
+    # Expand the bulk results as `resolve_targets` would: when no dependency is a target
+    # generator, that is the identity.
+    bulk_dependencies: dict[Address, Addresses] = {}
+    targets_by_address = {tgt.address: tgt for tgt in sorted_targets}
+
+    expanding_to_themselves = {
+        address
+        for address, tgt in targets_by_address.items()
+        if address.is_generated_target or not target_types_to_generate_requests.is_generator(tgt)
+    }
+
+    needs_expansion = []
+    for address, addresses in unexpanded_bulk_dependencies.items():
+        if expanding_to_themselves.issuperset(addresses):
+            bulk_dependencies[address] = addresses
+        else:
+            needs_expansion.append((address, addresses))
+
+    declined = [
+        i
+        for i, tgt in enumerate(sorted_targets)
+        if tgt.address in bulk_candidates and tgt.address not in unexpanded_bulk_dependencies
+    ]
+    # Expand in bulk the dependencies which are all targets peek already has; others individually.
+    expand_locally = {
+        address: [targets_by_address[dep] for dep in addresses]
+        for address, addresses in needs_expansion
+        if all(dep in targets_by_address for dep in addresses)
+    }
+    needs_expansion = [entry for entry in needs_expansion if entry[0] not in expand_locally]
+    locally_expanded = await expand_targets_in_bulk(
+        expand_locally, target_types_to_generate_requests, local_environment_name
+    )
+    for address, expanded in locally_expanded.items():
+        bulk_dependencies[address] = Addresses(tgt.address for tgt in expanded)
+
+    declined_dependencies, expanded_dependencies = await concurrently(
         concurrently(
             resolve_targets(
                 **implicitly(
                     DependenciesRequest(
-                        tgt.get(Dependencies), should_traverse_deps_predicate=AlwaysTraverseDeps()
+                        sorted_targets[i].get(Dependencies),
+                        should_traverse_deps_predicate=AlwaysTraverseDeps(),
                     )
                 )
             )
-            for tgt in sorted_targets
+            for i in declined
         ),
-        path_globs_to_snapshots(
-            PathGlobsBatch(
-                tuple(
-                    tgt[SourcesField].path_globs(unmatched_build_file_globs)
-                    for tgt in targets_with_sources
-                )
-            )
+        concurrently(
+            resolve_targets(**implicitly({addresses: Addresses}))
+            for _, addresses in needs_expansion
         ),
     )
-    for tgt, snapshot in zip(targets_with_sources, sources_snapshots):
-        tgt[SourcesField].validate_resolved_files(snapshot.files)
+    for i, deps in zip(declined, declined_dependencies):
+        dependencies_per_target[i] = deps
+    index_by_address = {tgt.address: i for i, tgt in enumerate(sorted_targets)}
+    for (address, _), deps in zip(needs_expansion, expanded_dependencies):
+        dependencies_per_target[index_by_address[address]] = deps
     if subsys.include_additional_info:
         additional_info_field_sets = [
             field_set_type.create(tgt)
@@ -354,14 +599,19 @@ async def get_target_data(
     else:
         group_additional_infos_by_address = {}
 
-    # TODO: This feels like something that could be merged with the above code somewhere
-    expanded_sources_map = {
-        tgt.address: snapshot for tgt, snapshot in zip(targets_with_sources, sources_snapshots)
-    }
+    specs: dict[Address, str] = {}
+
+    def spec(address: Address) -> str:
+        address_spec = specs.get(address)
+        if address_spec is None:
+            address_spec = specs[address] = address.spec
+        return address_spec
 
     expanded_dependencies = [
-        tuple(dep.address.spec for dep in deps)
-        for _, deps in zip(sorted_targets, dependencies_per_target)
+        tuple(spec(dep) for dep in bulk_dependencies[tgt.address])
+        if tgt.address in bulk_dependencies
+        else tuple(spec(dep.address) for dep in deps)
+        for tgt, deps in zip(sorted_targets, dependencies_per_target)
     ]
 
     dependencies_rules_map: dict[Address, tuple[str, ...] | None] = {}
@@ -425,6 +675,15 @@ async def get_target_data(
     )
 
 
+async def _validated_sources(
+    targets_with_sources: list[Target], snapshots_awaitable
+) -> dict[Address, Snapshot]:
+    snapshots = await snapshots_awaitable
+    for tgt, snapshot in zip(targets_with_sources, snapshots):
+        tgt[SourcesField].validate_resolved_files(snapshot.files)
+    return {tgt.address: snapshot for tgt, snapshot in zip(targets_with_sources, snapshots)}
+
+
 @goal_rule
 async def peek(
     console: Console,
@@ -440,23 +699,17 @@ async def peek(
     :return: The `Peek` goal.
     """
 
-    tds = await get_target_data(targets, **implicitly())
     # This method needs to be called in a @goal_rule, otherwise it fails out with Rule errors (when called in an @rule)
-    target_alias_to_goals_map = await _create_target_alias_to_goals_map(union_membership)
-
-    if target_alias_to_goals_map:
-        # Attach the goals to the target data, in the hopes that we can pull `_create_target_alias_to_goals_map` back into `get_target_data`
-        # TargetData is frozen so we need to create a new collection
-        tds = TargetDatas(
-            [
-                replace(
-                    td,
-                    goals=target_alias_to_goals_map.get(td.target.alias),
-                )
-                for td in tds
-            ]
-        )
-    output = render_json(tds, subsys.exclude_defaults, subsys.include_dep_rules)
+    tds, target_alias_to_goals_map = await concurrently(
+        get_target_data(targets, **implicitly()),
+        _create_target_alias_to_goals_map(union_membership),
+    )
+    output = render_json(
+        tds,
+        subsys.exclude_defaults,
+        subsys.include_dep_rules,
+        goals_by_alias=target_alias_to_goals_map or None,
+    )
 
     with subsys.output(console) as write_stdout:
         write_stdout(output)

@@ -33,6 +33,7 @@ from pants.engine.fs import FileContent, GlobMatchErrorBehavior, PathGlobs
 from pants.engine.internals.defaults import BuildFileDefaults, BuildFileDefaultsParserState
 from pants.engine.internals.dep_rules import (
     BuildFileDependencyRules,
+    DependencyRuleAction,
     DependencyRuleApplication,
     MaybeBuildFileDependencyRulesImplementation,
 )
@@ -632,6 +633,65 @@ async def _get_target_family_and_adaptor_for_dep_rules(
         )
         for address in addresses
     )
+
+
+async def get_dependencies_rule_applications(
+    requests: Sequence[tuple[Address, Addresses]],
+    maybe_build_file_rules_implementation: MaybeBuildFileDependencyRulesImplementation,
+    description_of_origin: str,
+    only_ruled: bool = False,
+) -> tuple[DependenciesRuleApplication, ...]:
+    """Like `get_dependencies_rule_application`, for many origin targets at once.
+
+    If `only_ruled`, dependencies to which no rules apply (which are always allowed) are omitted.
+    """
+    build_file_dependency_rules_class = (
+        maybe_build_file_rules_implementation.build_file_dependency_rules_class
+    )
+    if build_file_dependency_rules_class is None:
+        return tuple(DependenciesRuleApplication.allow_all() for _ in requests)
+
+    addresses = list(
+        dict.fromkeys(itertools.chain.from_iterable((origin, *deps) for origin, deps in requests))
+    )
+    families_and_adaptors = await _get_target_family_and_adaptor_for_dep_rules(
+        *addresses, description_of_origin=description_of_origin
+    )
+    by_address = dict(zip(addresses, families_and_adaptors))
+    applications = []
+    for origin, dependencies in requests:
+        origin_rules_family, origin_target = by_address[origin]
+        dependencies_rule: dict[Address, DependencyRuleApplication] = {}
+        for dependency_address in dependencies:
+            dependency_rules_family, dependency_target = by_address[dependency_address]
+            if only_ruled:
+                if (
+                    origin_rules_family.dependencies_rules is None
+                    and dependency_rules_family.dependents_rules is None
+                ):
+                    continue
+                action = build_file_dependency_rules_class.dependency_rule_action(
+                    origin_address=origin,
+                    origin_adaptor=origin_target,
+                    dependencies_rules=origin_rules_family.dependencies_rules,
+                    dependency_address=dependency_address,
+                    dependency_adaptor=dependency_target,
+                    dependents_rules=dependency_rules_family.dependents_rules,
+                )
+                if action is DependencyRuleAction.ALLOW:
+                    continue
+            dependencies_rule[dependency_address] = (
+                build_file_dependency_rules_class.check_dependency_rules(
+                    origin_address=origin,
+                    origin_adaptor=origin_target,
+                    dependencies_rules=origin_rules_family.dependencies_rules,
+                    dependency_address=dependency_address,
+                    dependency_adaptor=dependency_target,
+                    dependents_rules=dependency_rules_family.dependents_rules,
+                )
+            )
+        applications.append(DependenciesRuleApplication(origin, FrozenDict(dependencies_rule)))
+    return tuple(applications)
 
 
 @rule
