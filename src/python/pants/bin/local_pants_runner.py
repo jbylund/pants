@@ -42,6 +42,7 @@ from pants.option.bootstrap_options import DynamicRemoteOptions
 from pants.option.global_options import DynamicUIRenderer, GlobalOptions
 from pants.option.options import Options
 from pants.option.options_bootstrapper import OptionsBootstrapper
+from pants.util.lmdb_semaphores import release_lmdb_semaphores
 from pants.util.logging import LogLevel
 
 logger = logging.getLogger(__name__)
@@ -329,5 +330,8 @@ class LocalPantsRunner:
                 self.graph_session.scheduler_session.scheduler.shutdown(
                     self.session_end_tasks_timeout
                 )
+                # The process exits without finalizing the interpreter, so the stores are never
+                # closed: release their named semaphores (macOS only) as closing them would.
+                release_lmdb_semaphores(global_options.local_store_dir)
                 # Tear down the executor. See #16105.
                 self.executor.shutdown(3)
