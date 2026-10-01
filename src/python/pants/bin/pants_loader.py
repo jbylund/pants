@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 
+import atexit
 import importlib
 import locale
 import logging
@@ -110,7 +111,12 @@ class PantsLoader:
         except KeyboardInterrupt as e:
             print(f"Interrupted by user:\n{e}", file=sys.stderr)
             exit_code = PANTS_FAILED_EXIT_CODE
-        sys.exit(exit_code)
+        # The run is complete, so skip finalizing the interpreter, which for a large build graph
+        # means tearing down millions of objects one by one. Exit handlers still run.
+        atexit._run_exitfuncs()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(exit_code)
 
     @classmethod
     def main(cls) -> None:
