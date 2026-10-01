@@ -173,6 +173,15 @@ class WorkunitsCallback(ABC):
         """
 
     @property
+    def consumes_workunits(self) -> bool:
+        """Does this callback inspect the started/completed workunits it is passed?
+
+        Callbacks which only read run-wide metrics (counters and histograms) should return False, so
+        that workunits need not be converted to Python objects on their behalf.
+        """
+        return True
+
+    @property
     @abstractmethod
     def can_finish_async(self) -> bool:
         """Can this callback finish its work in the background after the Pants run has already
@@ -309,7 +318,13 @@ class _InnerHandler(threading.Thread):
         self.stop_request = threading.Event()
         self.report_interval = report_interval
         self.callbacks = callbacks
-        self.max_workunit_verbosity = max_workunit_verbosity
+        # If no callback inspects workunits, poll only the most severe ones: polling still drains
+        # the store, but converts (almost) nothing.
+        self.max_workunit_verbosity = (
+            max_workunit_verbosity
+            if any(callback.consumes_workunits for callback in callbacks)
+            else LogLevel.ERROR
+        )
         # TODO: Have a thread per callback so that some callbacks can always finish async even
         #  if others must be finished synchronously.
         self.block_until_complete = not allow_async_completion or any(
