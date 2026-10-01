@@ -74,10 +74,8 @@ from pants.engine.internals.graph import (
 from pants.engine.intrinsics import get_digest_contents, path_globs_to_paths
 from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import (
-    AllTargets,
     AllUnexpandedTargets,
     BulkValidateDependenciesRequest,
-    DependenciesRequest,
     ExplicitlyProvidedDependencies,
     ExplicitlyProvidedDependenciesRequest,
     FieldDefaultFactoryRequest,

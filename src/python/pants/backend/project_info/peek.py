@@ -7,10 +7,9 @@ import collections
 import collections.abc
 import json
 import logging
-import sys
 from abc import ABCMeta
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from pants.core.goals.deploy import Deploy, DeployFieldSet
@@ -32,7 +31,6 @@ from pants.engine.internals.dep_rules import DependencyRuleApplication, Dependen
 from pants.engine.internals.graph import (
     expand_targets_in_bulk,
     filter_targets,
-    hydrate_sources,
     resolve_dependencies_bulk,
     resolve_targets,
 )
@@ -238,27 +236,12 @@ class TargetData:
                 )
             }
 
-        result = {
+        result: dict[str, Any] = {
             "address": self.target.address.spec,
             "target_type": self.target.alias,
         }
         result.update(sorted(fields.items()))
         return result
-
-
-_FIELD_OUTPUT_KEYS: dict[type[Field], str] = {}
-
-
-def _field_output_key(field_type: type[Field]) -> str:
-    key = _FIELD_OUTPUT_KEYS.get(field_type)
-    if key is None:
-        key = (
-            f"{field_type.alias}_raw"
-            if issubclass(field_type, (SourcesField, Dependencies))
-            else field_type.alias
-        )
-        _FIELD_OUTPUT_KEYS[field_type] = key
-    return key
 
 
 _FIELD_OUTPUT_KEYS: dict[type[Field], str] = {}
@@ -439,7 +422,8 @@ async def get_target_data(
         collections.defaultdict(list)
     )
     inference_field_set_types = tuple(
-        inference_request_type.infer_from for inference_request_type in inference_request_types
+        inference_request_type.infer_from  # type: ignore[misc]
+        for inference_request_type in inference_request_types
     )
     for tgt in generic_candidates:
         applicable = set(applicable_field_set_types(inference_field_set_types, tgt))
@@ -447,7 +431,7 @@ async def get_target_data(
             tuple(
                 inference_request_type
                 for inference_request_type in inference_request_types
-                if inference_request_type.infer_from in applicable
+                if inference_request_type.infer_from in applicable  # type: ignore[misc]
             )
         ].append(tgt)
 
@@ -466,47 +450,45 @@ async def get_target_data(
         expanded_sources_map,
     ) = await concurrently(
         concurrently(
-                get_peek_bulk_dependencies(
-                    **implicitly({bulk_request: PeekBulkDependenciesRequest})
-                )
-                for bulk_request in bulk_requests
-            ),
+            get_peek_bulk_dependencies(**implicitly({bulk_request: PeekBulkDependenciesRequest}))
+            for bulk_request in bulk_requests
+        ),
         concurrently(
-                resolve_dependencies_bulk(
-                    BulkDependenciesRequest(
-                        tuple(group), FrozenDict(), inference_types=inference_types
-                    ),
-                    **implicitly(),
-                )
-                for inference_types, group in generic_groups.items()
-            ),
+            resolve_dependencies_bulk(
+                BulkDependenciesRequest(
+                    tuple(group), FrozenDict(), inference_types=inference_types
+                ),
+                **implicitly(),
+            )
+            for inference_types, group in generic_groups.items()
+        ),
         concurrently(
-                concurrently(
-                    resolve_targets(
-                        **implicitly(
-                            DependenciesRequest(
-                                sorted_targets[i].get(Dependencies),
-                                should_traverse_deps_predicate=AlwaysTraverseDeps(),
-                            )
+            concurrently(
+                resolve_targets(
+                    **implicitly(
+                        DependenciesRequest(
+                            sorted_targets[i].get(Dependencies),
+                            should_traverse_deps_predicate=AlwaysTraverseDeps(),
                         )
                     )
-                    for i in indices
                 )
-                for indices in indices_by_type.values()
-            ),
+                for i in indices
+            )
+            for indices in indices_by_type.values()
+        ),
         # Hydrating a sources field without codegen is snapshotting its globs, so all are
         # snapshotted at once.
         _validated_sources(
-                targets_with_sources,
-                path_globs_to_snapshots(
-                    PathGlobsBatch(
-                        tuple(
-                            tgt[SourcesField].path_globs(unmatched_build_file_globs)
-                            for tgt in targets_with_sources
-                        )
+            targets_with_sources,
+            path_globs_to_snapshots(
+                PathGlobsBatch(
+                    tuple(
+                        tgt[SourcesField].path_globs(unmatched_build_file_globs)
+                        for tgt in targets_with_sources
                     )
-                ),
+                )
             ),
+        ),
     )
     dependencies_per_target: list[Targets] = [Targets()] * len(sorted_targets)
     for indices, deps_for_type in zip(indices_by_type.values(), dependencies_per_type):
@@ -607,7 +589,7 @@ async def get_target_data(
             address_spec = specs[address] = address.spec
         return address_spec
 
-    expanded_dependencies = [
+    expanded_dependency_specs = [
         tuple(spec(dep) for dep in bulk_dependencies[tgt.address])
         if tgt.address in bulk_dependencies
         else tuple(spec(dep.address) for dep in deps)
@@ -671,7 +653,7 @@ async def get_target_data(
                 tgt.address, () if subsys.include_additional_info else None
             ),
         )
-        for tgt, expanded_deps in zip(sorted_targets, expanded_dependencies)
+        for tgt, expanded_deps in zip(sorted_targets, expanded_dependency_specs)
     )
 
 
