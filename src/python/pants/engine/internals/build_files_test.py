@@ -8,6 +8,7 @@ import re
 from collections import Counter
 from collections.abc import Mapping
 from textwrap import dedent
+from types import CodeType
 from typing import Any
 from unittest import mock
 
@@ -25,6 +26,7 @@ from pants.engine.internals.build_files import (
     BuildFileOptions,
     BuildFileSyntaxError,
     OptionalAddressFamily,
+    _compile_build_file,
     evaluate_preludes,
     parse_address_family,
 )
@@ -1235,3 +1237,23 @@ def test_build_file_duplicate_declared_names() -> None:
         match="A target already exists at `src/BUILD.bar` with name `foo` and target type `mock_tgt`",
     ):
         _ = rule_runner.request(AddressFamily, [AddressFamilyDir("src")])
+
+
+def test_compiled_build_file_is_shared_by_content_and_attributed_to_each_file() -> None:
+    content = b"x = 1\n\ndef f():\n    return env('VAR')\n"
+    first = _compile_build_file(content, "a/BUILD")
+    second = _compile_build_file(content, "b/BUILD")
+    assert first is second
+    assert second.env_vars == ("VAR",)
+    code = second.code_for("b/BUILD")
+    nested = [const for const in code.co_consts if isinstance(const, CodeType)]
+    assert code.co_filename == "b/BUILD"
+    assert nested and all(c.co_filename == "b/BUILD" for c in nested)
+    assert first.code_for("a/BUILD").co_filename == "a/BUILD"
+
+
+def test_compiled_build_file_errors_name_each_file() -> None:
+    content = b"target(\n"
+    for path in ("c/BUILD", "d/BUILD"):
+        with pytest.raises(BuildFileSyntaxError, match=path):
+            _compile_build_file(content, path)
