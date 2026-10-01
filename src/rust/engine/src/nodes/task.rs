@@ -15,7 +15,7 @@ use pyo3::{Bound, IntoPyObject};
 use rule_graph::DependencyKey;
 use workunit_store::{Level, RunningWorkunit, in_workunit};
 
-use super::{NodeKey, NodeResult, Params, attach_gated, select, task_context};
+use super::{NodeKey, NodeResult, Params, run_python, select, task_context};
 use crate::context::Context;
 use crate::externs::engine_aware::EngineAwareReturnType;
 use crate::externs::{self, GeneratorInput, GeneratorResponse};
@@ -137,7 +137,7 @@ impl Task {
                 externs::AllItem::Call(call) => Self::gen_call(context, params, entry, call).await,
                 externs::AllItem::Concurrent(items) => {
                     let values = Self::gen_all(context, params, entry, items).await?;
-                    attach_gated(&context.core, |py| {
+                    run_python(&context.core, move |py| {
                         externs::store_tuple(py, values)
                             .map_err(|err| Failure::from_py_err_with_gil(py, err))
                     })
@@ -204,8 +204,9 @@ impl Task {
             let response = match first_response.take() {
                 Some(response) => response,
                 None => {
-                    attach_gated(&context.core, |py| {
-                        externs::generator_send(py, &generator, input)
+                    let step_generator = generator.clone();
+                    run_python(&context.core, move |py| {
+                        externs::generator_send(py, &step_generator, input)
                     })
                     .await?
                 }
@@ -215,8 +216,11 @@ impl Task {
                     let _blocking_token = workunit.blocking();
                     let result = (call.call).await;
                     match result {
-                        Ok(value) => {
+                        Ok(externs::NativeResult::Value(value)) => {
                             input = GeneratorInput::Arg(value);
+                        }
+                        Ok(externs::NativeResult::Deferred(convert)) => {
+                            input = GeneratorInput::Deferred(convert);
                         }
                         Err(throw @ Failure::Throw { .. }) => {
                             input = GeneratorInput::Err(PyErr::from(throw));
@@ -241,14 +245,15 @@ impl Task {
                     let _blocking_token = workunit.blocking();
                     match Self::gen_all(context, params.clone(), entry, items).await {
                         Ok(values) => {
-                            // Tuple the values and send them in one gated attach.
+                            // Tuple the values and send them in one Python step.
+                            let step_generator = generator.clone();
                             first_response = Some(
-                                attach_gated(&context.core, |py| {
+                                run_python(&context.core, move |py| {
                                     let input = match externs::store_tuple(py, values) {
                                         Ok(t) => GeneratorInput::Arg(t),
                                         Err(err) => GeneratorInput::Err(err),
                                     };
-                                    externs::generator_send(py, &generator, input)
+                                    externs::generator_send(py, &step_generator, input)
                                 })
                                 .await?,
                             );
@@ -303,14 +308,19 @@ impl Task {
         let args = self.args;
         let core = context.core.clone();
         let coroutine_type = context.core.types.coroutine;
+        let task = self.task;
+        let args_arity = self.args_arity;
 
-        let (mut result_val, mut result_type, first_response) = task_context(
+        let (mut result_val, mut result_type, first_response) = crate::gil_thread::RULE_LABEL
+            .scope(
+                self.task,
+                task_context(
             context.clone(),
             self.task.side_effecting,
             &self.side_effected,
             async move {
-                attach_gated(&core, |py| {
-                    let func = self.task.func.0.value.bind(py);
+                run_python(&core, move |py| {
+                    let func = task.func.0.value.bind(py);
 
                     // If there are explicit positional arguments, apply any computed arguments as
                     // keywords. Otherwise, apply computed arguments as positional.
@@ -322,7 +332,7 @@ impl Task {
                             .map_err(PyErr::from)?;
                         let kwargs = PyDict::new(py);
                         for ((name, _), value) in
-                            self.task.args.iter().skip(self.args_arity.into()).zip(deps)
+                            task.args.iter().skip(args_arity.into()).zip(deps)
                         {
                             kwargs.set_item(name, &value)?;
                         }
@@ -350,17 +360,29 @@ impl Task {
                 })
                 .await
             },
-        )
-        .await?;
-
-        if result_type == context.core.types.coroutine {
-            let (new_val, new_type) = task_context(
-                context.clone(),
-                self.task.side_effecting,
-                &self.side_effected,
-                Self::generate(&context, workunit, params, self.entry, result_val, first_response),
+        ),
             )
             .await?;
+
+        if result_type == context.core.types.coroutine {
+            let (new_val, new_type) = crate::gil_thread::RULE_LABEL
+                .scope(
+                    self.task,
+                    task_context(
+                        context.clone(),
+                        self.task.side_effecting,
+                        &self.side_effected,
+                        Self::generate(
+                            &context,
+                            workunit,
+                            params,
+                            self.entry,
+                            result_val,
+                            first_response,
+                        ),
+                    ),
+                )
+                .await?;
             result_val = new_val;
             result_type = new_type;
         }
