@@ -24,7 +24,7 @@ use store::{Snapshot, Store};
 use workunit_store::{Level, in_workunit};
 
 use crate::externs::dep_inference::PyNativeDependenciesRequest;
-use crate::externs::{PyGeneratorResponseNativeCall, store_dict};
+use crate::externs::{DeferredValue, PyGeneratorResponseNativeCall, store_dict};
 use crate::nodes::{NodeResult, task_get_context};
 use crate::python::{Failure, Value};
 use crate::{Core, externs};
@@ -44,6 +44,24 @@ pub(crate) struct PreparedInferenceRequest {
 }
 
 impl PreparedInferenceRequest {
+    /// Like `prepare`, for a caller which holds the GIL.
+    pub fn prepare_with_gil(py: Python, deps_request: &Value, impl_hash: &str) -> NodeResult<Self> {
+        let PyNativeDependenciesRequest {
+            directory_digest,
+            metadata,
+        } = deps_request.bind(py).extract().map_err(PyErr::from)?;
+
+        Ok(Self {
+            digest: directory_digest,
+            cache_key_base: DependencyInferenceRequest {
+                input_file_path: String::new(),
+                input_file_digest: None,
+                metadata,
+                impl_hash: impl_hash.to_string(),
+            },
+        })
+    }
+
     pub async fn prepare(deps_request: Value, impl_hash: &str) -> NodeResult<Self> {
         let PyNativeDependenciesRequest {
             directory_digest,
@@ -80,14 +98,16 @@ impl PreparedInferenceRequest {
 }
 
 #[pyfunction]
-fn parse_dockerfile_info(deps_request: Value) -> PyGeneratorResponseNativeCall {
-    PyGeneratorResponseNativeCall::new(async move {
+fn parse_dockerfile_info(py: Python, deps_request: Value) -> PyGeneratorResponseNativeCall {
+    let prepared_request =
+        PreparedInferenceRequest::prepare_with_gil(py, &deps_request, dockerfile::IMPL_HASH);
+    PyGeneratorResponseNativeCall::new_deferred(async move {
         let context = task_get_context();
 
         let core = &context.core;
         let store = core.store();
-        let prepared_request =
-            PreparedInferenceRequest::prepare(deps_request, dockerfile::IMPL_HASH).await?;
+        let prepared_request = prepared_request?;
+        let result_type = core.types.parsed_dockerfile_info_result;
 
         in_workunit!(
             "parse_dockerfile_info",
@@ -100,10 +120,11 @@ fn parse_dockerfile_info(deps_request: Value) -> PyGeneratorResponseNativeCall {
                     })
                     .await?;
 
-                convert_results_to_tuple(parsed_results, |py, _path, result| {
+                Ok::<DeferredValue, Failure>(Box::new(move |py| {
+                convert_results_to_tuple_with_gil(py, parsed_results, |py, _path, result| {
                     Ok(externs::unsafe_call(
                         py,
-                        core.types.parsed_dockerfile_info_result,
+                        result_type,
                         &[
                             result
                                 .path
@@ -145,6 +166,7 @@ fn parse_dockerfile_info(deps_request: Value) -> PyGeneratorResponseNativeCall {
                         ],
                     ))
                 })
+                }))
             }
         )
         .await
@@ -152,14 +174,16 @@ fn parse_dockerfile_info(deps_request: Value) -> PyGeneratorResponseNativeCall {
 }
 
 #[pyfunction]
-fn parse_python_deps(deps_request: Value) -> PyGeneratorResponseNativeCall {
-    PyGeneratorResponseNativeCall::new(async move {
+fn parse_python_deps(py: Python, deps_request: Value) -> PyGeneratorResponseNativeCall {
+    let prepared_request =
+        PreparedInferenceRequest::prepare_with_gil(py, &deps_request, python::IMPL_HASH);
+    PyGeneratorResponseNativeCall::new_deferred(async move {
         let context = task_get_context();
 
         let core = &context.core;
         let store = core.store();
-        let prepared_request =
-            PreparedInferenceRequest::prepare(deps_request, python::IMPL_HASH).await?;
+        let prepared_request = prepared_request?;
+        let result_type = core.types.parsed_python_deps_result;
 
         in_workunit!(
             "parse_python_dependencies",
@@ -175,10 +199,11 @@ fn parse_python_deps(deps_request: Value) -> PyGeneratorResponseNativeCall {
                     )
                     .await?;
 
-                convert_results_to_tuple(parsed_results, |py, _path, result| {
+                Ok::<DeferredValue, Failure>(Box::new(move |py| {
+                convert_results_to_tuple_with_gil(py, parsed_results, |py, _path, result| {
                     Ok(externs::unsafe_call(
                         py,
-                        core.types.parsed_python_deps_result,
+                        result_type,
                         &[
                             result.imports.into_pyobject(py)?.into_any().into(),
                             result
@@ -194,6 +219,7 @@ fn parse_python_deps(deps_request: Value) -> PyGeneratorResponseNativeCall {
                         ],
                     ))
                 })
+                }))
             }
         )
         .await
@@ -272,15 +298,15 @@ struct PathAndDigest {
     digest: Digest,
 }
 
-fn convert_results_to_tuple<T, F>(
+fn convert_results_to_tuple_with_gil<T, F>(
+    py: Python<'_>,
     parsed_results: Vec<(PathBuf, T)>,
     result_converter: F,
 ) -> NodeResult<Value>
 where
     F: Fn(Python<'_>, &Path, T) -> Result<Value, PyErr>,
 {
-    // One attach for all files: each attach may be a GIL handoff.
-    Python::attach(|py| -> Result<Value, PyErr> {
+    (|| -> Result<Value, PyErr> {
         let mut result_pairs = Vec::with_capacity(parsed_results.len());
         for (path, result) in parsed_results {
             let path_str: String = path
@@ -302,8 +328,19 @@ where
             )?);
         }
         externs::store_tuple(py, result_pairs)
-    })
+    })()
     .map_err(Failure::from)
+}
+
+fn convert_results_to_tuple<T, F>(
+    parsed_results: Vec<(PathBuf, T)>,
+    result_converter: F,
+) -> NodeResult<Value>
+where
+    F: Fn(Python<'_>, &Path, T) -> Result<Value, PyErr>,
+{
+    // One attach for all files: each attach may be a GIL handoff.
+    Python::attach(|py| convert_results_to_tuple_with_gil(py, parsed_results, result_converter))
 }
 
 pub(crate) async fn get_or_create_inferred_dependencies<T, F>(
