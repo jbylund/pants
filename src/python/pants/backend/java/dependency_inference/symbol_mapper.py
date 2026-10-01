@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 import zlib
 from collections import defaultdict
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 from pants.backend.java.dependency_inference.java_parser import (
     JavaSourcesBatchRequest,
@@ -15,11 +15,9 @@ from pants.backend.java.dependency_inference.java_parser import (
     resolve_fallible_result_to_analysis,
 )
 from pants.backend.java.dependency_inference.types import JavaSourceDependencyAnalysis
-from pants.core.util_rules.source_files import determine_source_files
-from pants.engine.fs import Digest
-from pants.util.frozendict import FrozenDict
 from pants.backend.java.target_types import JavaSourceField
-from pants.core.util_rules.source_files import SourceFilesRequest
+from pants.core.util_rules.source_files import SourceFilesRequest, determine_source_files
+from pants.engine.fs import Digest
 from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import AllTargets, Targets
 from pants.engine.unions import UnionRule
@@ -28,6 +26,7 @@ from pants.jvm.dependency_inference.artifact_mapper import MutableTrieNode
 from pants.jvm.dependency_inference.symbol_mapper import FirstPartyMappingRequest, SymbolMap
 from pants.jvm.subsystems import JvmSubsystem
 from pants.jvm.target_types import JvmResolveField
+from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
 
 logger = logging.getLogger(__name__)
@@ -68,7 +67,8 @@ async def analyze_all_java_sources(java_targets: AllJavaTargets) -> AllJavaSourc
         batches[zlib.crc32(path.encode()) % _ANALYSIS_BATCHES].append(path)
     results = await concurrently(
         analyze_java_sources_batch(
-            JavaSourcesBatchRequest(tuple((path, digests[path]) for path in paths))
+            JavaSourcesBatchRequest(tuple((path, digests[path]) for path in paths)),
+            **implicitly(),
         )
         for _, paths in sorted(batches.items())
     )
@@ -91,7 +91,9 @@ async def map_first_party_java_targets_to_symbols(
     all_analyses = await analyze_all_java_sources(**implicitly())
     # Sources not analyzed in bulk are analyzed individually, which reports any failure.
     individually = [
-        target for target in java_targets if target[JavaSourceField].file_path not in all_analyses.by_file
+        target
+        for target in java_targets
+        if target[JavaSourceField].file_path not in all_analyses.by_file
     ]
     individual_analyses = dict(
         zip(
