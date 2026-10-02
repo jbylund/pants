@@ -76,14 +76,20 @@ async def infer_java_dependencies_and_exports_via_source_analysis(
     tgt = wrapped_tgt.target
     source_files = await determine_source_files(SourceFilesRequest([tgt[JavaSourceField]]))
 
-    explicitly_provided_deps, analysis = await concurrently(
+    explicitly_provided_deps, all_analyses = await concurrently(
         determine_explicitly_provided_dependencies(
             **implicitly(DependenciesRequest(tgt[Dependencies]))
         ),
-        resolve_fallible_result_to_analysis(
-            **implicitly(JavaSourceDependencyAnalysisRequest(source_files=source_files))
-        ),
+        symbol_mapper.analyze_all_java_sources(**implicitly()),
     )
+    analysis = (
+        all_analyses.by_file.get(source_files.files[0]) if len(source_files.files) == 1 else None
+    )
+    if analysis is None:
+        # Not analyzed in bulk: analyze individually, which reports any failure.
+        analysis = await resolve_fallible_result_to_analysis(
+            **implicitly(JavaSourceDependencyAnalysisRequest(source_files=source_files))
+        )
 
     types: OrderedSet[str] = OrderedSet()
     if java_infer_subsystem.imports:

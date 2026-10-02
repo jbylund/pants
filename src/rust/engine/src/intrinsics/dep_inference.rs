@@ -10,6 +10,7 @@ use dep_inference::javascript::ParsedJavascriptDependencies;
 use dep_inference::python::ParsedPythonDependencies;
 use dep_inference::{dockerfile, javascript, python};
 use fs::{DirectoryDigest, Entry, SymlinkBehavior};
+use futures::{StreamExt, TryStreamExt};
 use grpc_util::prost::MessageExt;
 use hashing::Digest;
 use protos::pb::pants::cache::{
@@ -23,7 +24,7 @@ use store::{Snapshot, Store};
 use workunit_store::{Level, in_workunit};
 
 use crate::externs::dep_inference::PyNativeDependenciesRequest;
-use crate::externs::{PyGeneratorResponseNativeCall, store_dict};
+use crate::externs::{DeferredValue, PyGeneratorResponseNativeCall, store_dict};
 use crate::nodes::{NodeResult, task_get_context};
 use crate::python::{Failure, Value};
 use crate::{Core, externs};
@@ -43,6 +44,24 @@ pub(crate) struct PreparedInferenceRequest {
 }
 
 impl PreparedInferenceRequest {
+    /// Like `prepare`, for a caller which holds the GIL.
+    pub fn prepare_with_gil(py: Python, deps_request: &Value, impl_hash: &str) -> NodeResult<Self> {
+        let PyNativeDependenciesRequest {
+            directory_digest,
+            metadata,
+        } = deps_request.bind(py).extract().map_err(PyErr::from)?;
+
+        Ok(Self {
+            digest: directory_digest,
+            cache_key_base: DependencyInferenceRequest {
+                input_file_path: String::new(),
+                input_file_digest: None,
+                metadata,
+                impl_hash: impl_hash.to_string(),
+            },
+        })
+    }
+
     pub async fn prepare(deps_request: Value, impl_hash: &str) -> NodeResult<Self> {
         let PyNativeDependenciesRequest {
             directory_digest,
@@ -79,14 +98,16 @@ impl PreparedInferenceRequest {
 }
 
 #[pyfunction]
-fn parse_dockerfile_info(deps_request: Value) -> PyGeneratorResponseNativeCall {
-    PyGeneratorResponseNativeCall::new(async move {
+fn parse_dockerfile_info(py: Python, deps_request: Value) -> PyGeneratorResponseNativeCall {
+    let prepared_request =
+        PreparedInferenceRequest::prepare_with_gil(py, &deps_request, dockerfile::IMPL_HASH);
+    PyGeneratorResponseNativeCall::new_deferred(async move {
         let context = task_get_context();
 
         let core = &context.core;
         let store = core.store();
-        let prepared_request =
-            PreparedInferenceRequest::prepare(deps_request, dockerfile::IMPL_HASH).await?;
+        let prepared_request = prepared_request?;
+        let result_type = core.types.parsed_dockerfile_info_result;
 
         in_workunit!(
             "parse_dockerfile_info",
@@ -99,10 +120,11 @@ fn parse_dockerfile_info(deps_request: Value) -> PyGeneratorResponseNativeCall {
                     })
                     .await?;
 
-                convert_results_to_tuple(parsed_results, |py, _path, result| {
+                Ok::<DeferredValue, Failure>(Box::new(move |py| {
+                convert_results_to_tuple_with_gil(py, parsed_results, |py, _path, result| {
                     Ok(externs::unsafe_call(
                         py,
-                        core.types.parsed_dockerfile_info_result,
+                        result_type,
                         &[
                             result
                                 .path
@@ -144,6 +166,7 @@ fn parse_dockerfile_info(deps_request: Value) -> PyGeneratorResponseNativeCall {
                         ],
                     ))
                 })
+                }))
             }
         )
         .await
@@ -151,14 +174,16 @@ fn parse_dockerfile_info(deps_request: Value) -> PyGeneratorResponseNativeCall {
 }
 
 #[pyfunction]
-fn parse_python_deps(deps_request: Value) -> PyGeneratorResponseNativeCall {
-    PyGeneratorResponseNativeCall::new(async move {
+fn parse_python_deps(py: Python, deps_request: Value) -> PyGeneratorResponseNativeCall {
+    let prepared_request =
+        PreparedInferenceRequest::prepare_with_gil(py, &deps_request, python::IMPL_HASH);
+    PyGeneratorResponseNativeCall::new_deferred(async move {
         let context = task_get_context();
 
         let core = &context.core;
         let store = core.store();
-        let prepared_request =
-            PreparedInferenceRequest::prepare(deps_request, python::IMPL_HASH).await?;
+        let prepared_request = prepared_request?;
+        let result_type = core.types.parsed_python_deps_result;
 
         in_workunit!(
             "parse_python_dependencies",
@@ -174,10 +199,11 @@ fn parse_python_deps(deps_request: Value) -> PyGeneratorResponseNativeCall {
                     )
                     .await?;
 
-                convert_results_to_tuple(parsed_results, |py, _path, result| {
+                Ok::<DeferredValue, Failure>(Box::new(move |py| {
+                convert_results_to_tuple_with_gil(py, parsed_results, |py, _path, result| {
                     Ok(externs::unsafe_call(
                         py,
-                        core.types.parsed_python_deps_result,
+                        result_type,
                         &[
                             result.imports.into_pyobject(py)?.into_any().into(),
                             result
@@ -193,6 +219,7 @@ fn parse_python_deps(deps_request: Value) -> PyGeneratorResponseNativeCall {
                         ],
                     ))
                 })
+                }))
             }
         )
         .await
@@ -229,7 +256,7 @@ fn parse_javascript_deps(deps_request: Value) -> PyGeneratorResponseNativeCall {
                         core,
                         &store,
                         &prepared_request,
-                        |content, path| {
+                        move |content, path| {
                             javascript::get_dependencies(content, path.clone(), js_metadata.clone())
                         },
                     )
@@ -271,16 +298,17 @@ struct PathAndDigest {
     digest: Digest,
 }
 
-fn convert_results_to_tuple<T, F>(
+fn convert_results_to_tuple_with_gil<T, F>(
+    py: Python<'_>,
     parsed_results: Vec<(PathBuf, T)>,
     result_converter: F,
 ) -> NodeResult<Value>
 where
     F: Fn(Python<'_>, &Path, T) -> Result<Value, PyErr>,
 {
-    let mut result_pairs = Vec::with_capacity(parsed_results.len());
-    for (path, result) in parsed_results {
-        let py_result_pair = Python::attach(|py| -> Result<_, PyErr> {
+    (|| -> Result<Value, PyErr> {
+        let mut result_pairs = Vec::with_capacity(parsed_results.len());
+        for (path, result) in parsed_results {
             let path_str: String = path
                 .as_os_str()
                 .to_str()
@@ -291,18 +319,28 @@ where
                         path.display()
                     ))
                 })?;
-            externs::store_tuple(
+            result_pairs.push(externs::store_tuple(
                 py,
                 vec![
                     path_str.into_pyobject(py)?.into_any().into(),
                     result_converter(py, &path, result)?,
                 ],
-            )
-        })?;
-        result_pairs.push(py_result_pair);
-    }
+            )?);
+        }
+        externs::store_tuple(py, result_pairs)
+    })()
+    .map_err(Failure::from)
+}
 
-    Python::attach(|py| externs::store_tuple(py, result_pairs)).map_err(Failure::from)
+fn convert_results_to_tuple<T, F>(
+    parsed_results: Vec<(PathBuf, T)>,
+    result_converter: F,
+) -> NodeResult<Value>
+where
+    F: Fn(Python<'_>, &Path, T) -> Result<Value, PyErr>,
+{
+    // One attach for all files: each attach may be a GIL handoff.
+    Python::attach(|py| convert_results_to_tuple_with_gil(py, parsed_results, result_converter))
 }
 
 pub(crate) async fn get_or_create_inferred_dependencies<T, F>(
@@ -312,8 +350,8 @@ pub(crate) async fn get_or_create_inferred_dependencies<T, F>(
     dependencies_parser: F,
 ) -> NodeResult<Vec<(PathBuf, T)>>
 where
-    T: serde::de::DeserializeOwned + serde::Serialize,
-    F: Fn(&str, &PathBuf) -> Result<T, String>,
+    T: serde::de::DeserializeOwned + serde::Serialize + Send + 'static,
+    F: Fn(&str, &PathBuf) -> Result<T, String> + Clone + Send + Sync + 'static,
 {
     let snapshot = request.snapshot(store).await?;
     let mut files = Vec::new();
@@ -328,31 +366,45 @@ where
             }
         });
 
-    let mut results = Vec::with_capacity(files.len());
-    for file in &files {
-        let cache_key = request.cache_key_for_file(&file.path, file.digest);
-        let result = if let Some(result) = lookup_inferred_dependencies(&cache_key, core).await? {
-            result
-        } else {
-            let bytes = store
-                .load_file_bytes_with(file.digest, |bytes| Vec::from(bytes))
-                .await?;
-            let contents = String::from_utf8(bytes)
-                .map_err(|err| format!("Failed to convert digest bytes to utf-8: {err}"))?;
-            let result = dependencies_parser(&contents, &file.path)?;
-            core.local_cache
-                .store(
-                    &cache_key,
-                    Bytes::from(serde_json::to_string(&result).map_err(|e| {
-                        format!("Failed to serialize dep inference cache result: {e}")
-                    })?),
-                )
-                .await?;
-            result
-        };
-        results.push((file.path.clone(), result));
-    }
-    Ok(results)
+    // Files are loaded and parsed concurrently (the parse runs on the blocking pool as part of
+    // loading the file), with results kept in input order.
+    let parallelism = std::thread::available_parallelism().map_or(8, |n| n.get());
+    futures::stream::iter(files.into_iter().map(|file| {
+        let dependencies_parser = dependencies_parser.clone();
+        async move {
+            // With the local cache disabled, its results may not be read or written.
+            let cache_key = core
+                .local_cache_enabled
+                .then(|| request.cache_key_for_file(&file.path, file.digest));
+            if let Some(cache_key) = &cache_key {
+                if let Some(result) = lookup_inferred_dependencies(cache_key, core).await? {
+                    return Ok::<_, Failure>((file.path, result));
+                }
+            }
+            let path = file.path.clone();
+            let result = store
+                .load_file_bytes_with(file.digest, move |bytes| {
+                    std::str::from_utf8(bytes)
+                        .map_err(|err| format!("Failed to convert digest bytes to utf-8: {err}"))
+                        .and_then(|contents| dependencies_parser(contents, &path))
+                })
+                .await??;
+            if let Some(cache_key) = &cache_key {
+                core.local_cache
+                    .store(
+                        cache_key,
+                        Bytes::from(serde_json::to_string(&result).map_err(|e| {
+                            format!("Failed to serialize dep inference cache result: {e}")
+                        })?),
+                    )
+                    .await?;
+            }
+            Ok((file.path, result))
+        }
+    }))
+    .buffered(parallelism)
+    .try_collect()
+    .await
 }
 
 pub(crate) async fn lookup_inferred_dependencies<T: serde::de::DeserializeOwned>(

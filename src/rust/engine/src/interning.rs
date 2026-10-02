@@ -54,6 +54,14 @@ impl Interns {
         let (id, type_id): (u64, TypeId) = {
             let v = v.bind(py);
             let keys = self.keys.bind(py);
+            // Most values have been interned before: a lookup avoids allocating a candidate id.
+            if let Some(id) = keys.get_item(v)? {
+                return Ok(Key::new(
+                    id.extract()?,
+                    TypeId::new(&v.get_type()),
+                    v.clone().unbind().into(),
+                ));
+            }
             // `setdefault` is a single dict operation, so the check-and-assign is atomic on
             // free-threaded builds (a separate get-then-set lets two threads mint distinct ids
             // for equal values, breaking Key's id-based equality). A lost race only wastes an id.

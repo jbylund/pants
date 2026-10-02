@@ -7,13 +7,18 @@ from collections.abc import Iterable
 from pants.backend.visibility.rule_types import BuildFileVisibilityRules
 from pants.backend.visibility.subsystem import VisibilitySubsystem
 from pants.engine.goal import CurrentExecutingGoals
-from pants.engine.internals.build_files import get_dependencies_rule_application
+from pants.engine.internals.build_files import (
+    get_dependencies_rule_application,
+    get_dependencies_rule_applications,
+)
 from pants.engine.internals.dep_rules import (
     BuildFileDependencyRulesImplementation,
     BuildFileDependencyRulesImplementationRequest,
+    MaybeBuildFileDependencyRulesImplementation,
 )
 from pants.engine.rules import Rule, collect_rules, implicitly, rule
 from pants.engine.target import (
+    BulkValidateDependenciesRequest,
     Dependencies,
     DependenciesRuleApplicationRequest,
     FieldSet,
@@ -64,6 +69,31 @@ async def visibility_validate_dependencies(
     return ValidatedDependencies()
 
 
+class VisibilityBulkValidateDependenciesRequest(BulkValidateDependenciesRequest):
+    validates = VisibilityValidateDependenciesRequest
+
+
+@rule
+async def visibility_bulk_validate_dependencies(
+    request: VisibilityBulkValidateDependenciesRequest,
+    visibility: VisibilitySubsystem,
+    goals: CurrentExecutingGoals,
+    maybe_build_file_rules_implementation: MaybeBuildFileDependencyRulesImplementation,
+) -> ValidatedDependencies:
+    if not visibility.enforce or goals.is_running("lint"):
+        return ValidatedDependencies()
+    applications = await get_dependencies_rule_applications(
+        [(tgt.address, dependencies) for tgt, dependencies in request.targets_and_dependencies],
+        maybe_build_file_rules_implementation,
+        description_of_origin="get dependency rules",
+        # Dependencies to which no rules apply are allowed: there is nothing to execute for them.
+        only_ruled=True,
+    )
+    for application in applications:
+        application.execute_actions()
+    return ValidatedDependencies()
+
+
 def rules() -> Iterable[Rule | UnionRule]:
     return (
         *collect_rules(),
@@ -72,4 +102,5 @@ def rules() -> Iterable[Rule | UnionRule]:
             BuildFileVisibilityImplementationRequest,
         ),
         UnionRule(ValidateDependenciesRequest, VisibilityValidateDependenciesRequest),
+        UnionRule(BulkValidateDependenciesRequest, VisibilityBulkValidateDependenciesRequest),
     )

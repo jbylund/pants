@@ -14,7 +14,7 @@ from collections import defaultdict
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from itertools import chain
-from typing import DefaultDict, cast
+from typing import DefaultDict, Literal, cast
 
 import toml
 from packaging.requirements import InvalidRequirement
@@ -62,18 +62,22 @@ from pants.core.util_rules.unowned_dependency_behavior import (
     UnownedDependencyUsage,
 )
 from pants.engine.addresses import Address, Addresses, UnparsedAddressInputs
+from pants.engine.environment import EnvironmentName
 from pants.engine.fs import GlobMatchErrorBehavior, PathGlobs
 from pants.engine.internals.graph import (
     determine_explicitly_provided_dependencies,
     resolve_target,
     resolve_targets,
     resolve_unparsed_address_inputs,
+    validate_dependencies,
 )
 from pants.engine.intrinsics import get_digest_contents, path_globs_to_paths
 from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import (
-    DependenciesRequest,
+    AllUnexpandedTargets,
+    BulkValidateDependenciesRequest,
     ExplicitlyProvidedDependencies,
+    ExplicitlyProvidedDependenciesRequest,
     FieldDefaultFactoryRequest,
     FieldDefaultFactoryResult,
     FieldSet,
@@ -82,6 +86,7 @@ from pants.engine.target import (
     InferDependenciesRequest,
     InferredDependencies,
     InvalidFieldException,
+    Target,
     TargetFilesGeneratorSettings,
     TargetFilesGeneratorSettingsRequest,
     ValidatedDependencies,
@@ -175,6 +180,16 @@ async def generate_targets_from_pex_binaries(
 # -----------------------------------------------------------------------------------------------
 
 
+def _relative_to_source_root(path: str, source_root: str) -> str:
+    # Equivalent to `os.path.relpath` for a normalized relative path under the source root, without
+    # its `getcwd` calls.
+    if source_root == ".":
+        return path
+    if path.startswith(source_root + os.path.sep):
+        return path[len(source_root) + 1 :]
+    return os.path.relpath(path, source_root)
+
+
 @rule(desc="Determining the entry point for a `pex_binary` target")
 async def resolve_pex_entry_point(request: ResolvePexEntryPointRequest) -> ResolvedPexEntryPoint:
     ep_val = request.entry_point_field.value
@@ -219,7 +234,7 @@ async def resolve_pex_entry_point(request: ResolvePexEntryPointRequest) -> Resol
         )
     entry_point_path = entry_point_paths.files[0]
     source_root = await get_source_root(SourceRootRequest.for_file(entry_point_path))
-    stripped_source_path = os.path.relpath(entry_point_path, source_root.path)
+    stripped_source_path = _relative_to_source_root(entry_point_path, source_root.path)
     module_base, _ = os.path.splitext(stripped_source_path)
     normalized_path = module_base.replace(os.path.sep, ".")
     return ResolvedPexEntryPoint(
@@ -255,7 +270,7 @@ async def infer_pex_binary_entry_point_dependency(
 
     explicitly_provided_deps, entry_point = await concurrently(
         determine_explicitly_provided_dependencies(
-            **implicitly(DependenciesRequest(request.field_set.dependencies))
+            ExplicitlyProvidedDependenciesRequest(request.field_set.dependencies), **implicitly()
         ),
         resolve_pex_entry_point(ResolvePexEntryPointRequest(entry_point_field)),
     )
@@ -560,7 +575,7 @@ async def infer_python_distribution_dependencies(
 
     explicitly_provided_deps, distribution_entry_points, provides_entry_points = await concurrently(
         determine_explicitly_provided_dependencies(
-            **implicitly(DependenciesRequest(request.field_set.dependencies))
+            ExplicitlyProvidedDependenciesRequest(request.field_set.dependencies), **implicitly()
         ),
         resolve_python_distribution_entry_points(
             ResolvePythonDistributionEntryPointsRequest(
@@ -801,6 +816,76 @@ async def validate_python_dependencies(
     return ValidatedDependencies()
 
 
+class PythonBulkValidateDependenciesRequest(BulkValidateDependenciesRequest):
+    validates = PythonValidateDependenciesRequest
+
+
+def _interpreter_constraints_of(tgt: Target, python_setup: PythonSetup) -> tuple[str, ...]:
+    return tgt[InterpreterConstraintsField].value_or_configured_default(
+        python_setup,
+        tgt[PythonResolveField] if tgt.has_field(PythonResolveField) else None,
+    )
+
+
+@rule
+async def python_bulk_validate_dependencies(
+    request: PythonBulkValidateDependenciesRequest,
+    python_setup: PythonSetup,
+    all_targets: AllUnexpandedTargets,
+    environment_name: EnvironmentName,
+) -> ValidatedDependencies:
+    targets_by_address = {tgt.address: tgt for tgt in all_targets}
+    # For each dependency: its interpreter constraints, None if it has none, or False if it is not
+    # a known target.
+    dependency_ics: dict[Address, tuple[str, ...] | None | Literal[False]] = {}
+
+    def ics_of_dependency(dependency: Address) -> tuple[str, ...] | None | Literal[False]:
+        dep_tgt = targets_by_address.get(dependency)
+        if dep_tgt is None:
+            return False
+        if not dep_tgt.has_field(InterpreterConstraintsField):
+            return None
+        return _interpreter_constraints_of(dep_tgt, python_setup)
+
+    contains: dict[tuple[tuple[str, ...], tuple[str, ...]], bool] = {}
+    invalid = []
+    for tgt, dependencies in request.targets_and_dependencies:
+        target_ics = _interpreter_constraints_of(tgt, python_setup)
+        for dependency in dependencies:
+            ics = dependency_ics.get(dependency)
+            if ics is None and dependency not in dependency_ics:
+                ics = dependency_ics[dependency] = ics_of_dependency(dependency)
+            if ics is False:
+                invalid.append((tgt, dependencies))
+                break
+            if ics is None:
+                continue
+            key = (ics, target_ics)
+            if key not in contains:
+                contains[key] = interpreter_constraints_contains(
+                    key[0], key[1], python_setup.interpreter_versions_universe
+                )
+            if not contains[key]:
+                invalid.append((tgt, dependencies))
+                break
+    # Report (or, if the bulk check was conservative, accept) each of these as the per-target
+    # validation does.
+    await concurrently(
+        validate_dependencies(
+            **implicitly(
+                {
+                    PythonValidateDependenciesRequest(
+                        DependencyValidationFieldSet.create(tgt), dependencies
+                    ): ValidateDependenciesRequest,
+                    environment_name: EnvironmentName,
+                }
+            )
+        )
+        for tgt, dependencies in invalid
+    )
+    return ValidatedDependencies()
+
+
 @rule
 async def python_get_resolve_from_resolve_like_field_request(
     request: PythonResolveLikeFieldToValueRequest, python_setup: PythonSetup
@@ -821,5 +906,6 @@ def rules():
         UnionRule(InferDependenciesRequest, InferPexBinaryEntryPointDependency),
         UnionRule(InferDependenciesRequest, InferPythonDistributionDependencies),
         UnionRule(ValidateDependenciesRequest, PythonValidateDependenciesRequest),
+        UnionRule(BulkValidateDependenciesRequest, PythonBulkValidateDependenciesRequest),
         UnionRule(ResolveLikeFieldToValueRequest, PythonResolveLikeFieldToValueRequest),
     )
