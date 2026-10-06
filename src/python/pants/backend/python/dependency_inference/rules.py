@@ -409,7 +409,7 @@ class PythonSourceOwnersByFile:
 
 
 @rule
-async def python_source_owners_by_file(
+async def get_python_source_owners_by_file(
     all_python_targets: AllPythonTargets, python_setup: PythonSetup
 ) -> PythonSourceOwnersByFile:
     owners: dict[str, list[tuple[Address, str | None]]] = {}
@@ -667,7 +667,7 @@ async def infer_python_init_dependencies(
     )
     if not init_files.snapshot.files:
         return InferredDependencies([])
-    owners_by_file = await python_source_owners_by_file(**implicitly())
+    owners_by_file = await get_python_source_owners_by_file(**implicitly())
     resolve = request.field_set.resolve.normalized_value(python_setup)
     python_owners = [
         address
@@ -706,7 +706,7 @@ async def infer_python_conftest_dependencies(
     )
     if not conftest_files.snapshot.files:
         return InferredDependencies([])
-    owners_by_file = await python_source_owners_by_file(**implicitly())
+    owners_by_file = await get_python_source_owners_by_file(**implicitly())
     resolve = request.field_set.resolve.normalized_value(python_setup)
     indexed = [f for f in conftest_files.snapshot.files if f in owners_by_file.owners]
     unindexed = [f for f in conftest_files.snapshot.files if f not in owners_by_file.owners]
@@ -763,7 +763,7 @@ def import_rules():
 def rules():
     return [
         *import_rules(),
-        python_source_owners_by_file,
+        get_python_source_owners_by_file,
         infer_python_init_dependencies,
         infer_python_conftest_dependencies,
         *ancestor_files.rules(),
