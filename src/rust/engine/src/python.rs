@@ -4,6 +4,7 @@
 use std::borrow::Borrow;
 use std::convert::Infallible;
 use std::ops::Deref;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::{fmt, hash};
 
@@ -157,15 +158,29 @@ impl TypeId {
     }
 
     pub fn union_in_scope_types(&self) -> Option<Vec<TypeId>> {
+        // Fixed when a union is declared, but consulted for every call of a polymorphic rule: cached
+        // (by a `PinnedTypeId`, which keeps the union alive, and with it its in-scope types) to avoid
+        // attaching to Python for each call.
+        static CACHE: std::sync::LazyLock<
+            parking_lot::RwLock<HashMap<PinnedTypeId, Option<Vec<TypeId>>>>,
+        > = std::sync::LazyLock::new(Default::default);
+        if let Some(in_scope_types) = CACHE.read().get(self) {
+            return in_scope_types.clone();
+        }
         Python::attach(|py| {
-            externs::union_in_scope_types(py, &self.as_py_type(py))
+            let py_type = self.as_py_type(py);
+            let in_scope_types = externs::union_in_scope_types(py, &py_type)
                 .unwrap()
                 .map(|types| {
                     types
                         .into_iter()
                         .map(|t| TypeId::new(&t.as_borrowed()))
-                        .collect()
-                })
+                        .collect::<Vec<_>>()
+                });
+            CACHE
+                .write()
+                .insert(PinnedTypeId::new(&py_type), in_scope_types.clone());
+            in_scope_types
         })
     }
 }
@@ -352,7 +367,30 @@ impl Key {
 // in `Arc` like this, because `Py<T>` internally acquires a (non-GIL) global lock during `Clone`
 // and `Drop`.
 #[derive(Clone)]
-pub struct Value(Arc<Py<PyAny>>);
+pub struct Value(Arc<PyHandle>);
+
+/// Owns a Python object. When dropped off the GIL thread, the object is handed to the GIL thread
+/// to be released, rather than queued in pyo3's global pool of deferred reference count
+/// decrements (which every call from Python into Rust would then contend on).
+pub struct PyHandle(Option<Py<PyAny>>);
+
+impl PyHandle {
+    fn get(&self) -> &Py<PyAny> {
+        self.0.as_ref().expect("Only taken when consumed.")
+    }
+
+    fn take(mut self) -> Py<PyAny> {
+        self.0.take().expect("Only taken when consumed.")
+    }
+}
+
+impl Drop for PyHandle {
+    fn drop(&mut self) {
+        if let Some(obj) = self.0.take() {
+            crate::gil_thread::release(obj);
+        }
+    }
+}
 
 // NB: The size of objects held by a Graph is tracked independently, so we assert that each Value
 // is only as large as its pointer.
@@ -360,20 +398,20 @@ known_deep_size!(8; Value);
 
 impl Value {
     pub fn new(obj: Py<PyAny>) -> Value {
-        Value(Arc::new(obj))
+        Value(Arc::new(PyHandle(Some(obj))))
     }
 
     // NB: Longer name because overloaded in a few places.
     pub fn consume_into_py_object(self, py: Python) -> Py<PyAny> {
         match Arc::try_unwrap(self.0) {
-            Ok(obj) => obj,
-            Err(arc_handle) => arc_handle.clone_ref(py),
+            Ok(handle) => handle.take(),
+            Err(arc_handle) => arc_handle.get().clone_ref(py),
         }
     }
 
     /// Bind this value to the given Python GIL context as a `pyo3::Bound` smart pointer.
     pub fn bind<'py>(&self, py: Python<'py>) -> &Bound<'py, PyAny> {
-        self.0.bind(py)
+        self.0.get().bind(py)
     }
 }
 
@@ -385,7 +423,7 @@ impl workunit_store::Value for Value {
 
 impl PartialEq for Value {
     fn eq(&self, other: &Value) -> bool {
-        Python::attach(|py| externs::equals(self.bind(py), other.0.bind(py)))
+        Python::attach(|py| externs::equals(self.bind(py), other.bind(py)))
     }
 }
 
@@ -394,7 +432,7 @@ impl Eq for Value {}
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let repr = Python::attach(|py| {
-            let obj = self.0.bind(py);
+            let obj = self.bind(py);
             externs::val_to_str(obj)
         });
         write!(f, "{repr}")
@@ -421,7 +459,7 @@ impl<'py> IntoPyObject<'py> for &Value {
     type Error = Infallible;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        let py_any = self.0.clone_ref(py);
+        let py_any = self.0.get().clone_ref(py);
         Ok(py_any.into_bound(py))
     }
 }
@@ -429,8 +467,8 @@ impl<'py> IntoPyObject<'py> for &Value {
 impl From<Value> for Py<PyAny> {
     fn from(value: Value) -> Self {
         match Arc::try_unwrap(value.0) {
-            Ok(obj) => obj,
-            Err(arc_handle) => Python::attach(|py| arc_handle.clone_ref(py)),
+            Ok(handle) => handle.take(),
+            Err(arc_handle) => Python::attach(|py| arc_handle.get().clone_ref(py)),
         }
     }
 }
@@ -537,7 +575,7 @@ impl Failure {
                 }) => {
                     // Preserve tracebacks (both engine and python) from upstream error by using any existing
                     // engine traceback and restoring the original python exception cause.
-                    py_err.set_cause(py, Some(PyErr::from_value(val.0.bind(py).to_owned())));
+                    py_err.set_cause(py, Some(PyErr::from_value(val.bind(py).to_owned())));
                     (
                         format!(
                             "{python_traceback}\nDuring handling of the above exception, another exception occurred:\n\n"
@@ -610,7 +648,7 @@ impl fmt::Display for Failure {
             }
             Failure::Throw { val, .. } => {
                 let repr = Python::attach(|py| {
-                    let obj = val.0.bind(py);
+                    let obj = val.bind(py);
                     externs::val_to_str(obj)
                 });
                 write!(f, "{repr}")

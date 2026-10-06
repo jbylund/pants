@@ -17,7 +17,6 @@ from pants.engine.addresses import Address
 from pants.engine.environment import EnvironmentName
 from pants.engine.fs import Digest, MergeDigests, Workspace
 from pants.engine.goal import Goal, GoalSubsystem
-from pants.engine.internals.graph import find_valid_field_sets
 from pants.engine.internals.specs_rules import find_valid_field_sets_for_target_roots
 from pants.engine.intrinsics import merge_digests
 from pants.engine.rules import collect_rules, concurrently, goal_rule, implicitly, rule
@@ -27,7 +26,6 @@ from pants.engine.target import (
     Dependencies,
     DepsTraversalBehavior,
     FieldSet,
-    FieldSetsPerTargetRequest,
     NoApplicableTargetsBehavior,
     ShouldTraverseDepsPredicate,
     SpecialCasedDependencies,
@@ -175,14 +173,14 @@ class AllPackageableTargets(Targets):
 
 
 @rule(desc="Find all packageable targets in project", level=LogLevel.DEBUG)
-async def find_all_packageable_targets(all_targets: AllTargets) -> AllPackageableTargets:
-    fs_per_target = await find_valid_field_sets(
-        FieldSetsPerTargetRequest(PackageFieldSet, all_targets), **implicitly()
-    )
+async def find_all_packageable_targets(
+    all_targets: AllTargets, union_membership: UnionMembership
+) -> AllPackageableTargets:
+    field_set_types = union_membership.get(PackageFieldSet)
     return AllPackageableTargets(
         target
-        for target, field_sets in zip(all_targets, fs_per_target.collection)
-        if len(field_sets) > 0
+        for target in all_targets
+        if any(field_set_type.is_applicable(target) for field_set_type in field_set_types)
     )
 
 
