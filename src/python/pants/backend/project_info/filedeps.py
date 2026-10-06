@@ -81,7 +81,7 @@ async def file_deps(
         targets = transitive_targets.closure
     else:
         # NB: We must preserve target generators, not replace with their generated targets.
-        targets = await resolve_unexpanded_targets(addresses)
+        targets = await resolve_unexpanded_targets(addresses, **implicitly())
 
     build_file_addresses = await concurrently(
         find_build_file(BuildFileAddressRequest(tgt.address, description_of_origin="CLI arguments"))
