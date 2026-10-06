@@ -502,7 +502,7 @@ class PythonModuleOwnersLookup:
 
 
 @rule
-async def python_module_owners_lookup(
+async def get_python_module_owners_lookup(
     first_party_mapping: FirstPartyPythonModuleMapping,
     third_party_mapping: ThirdPartyPythonModuleMapping,
 ) -> PythonModuleOwnersLookup:
