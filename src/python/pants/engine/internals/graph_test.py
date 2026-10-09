@@ -1003,6 +1003,7 @@ def test_owners_in_ancestor_directories(owners_rule_runner: RuleRunner) -> None:
                 """\
                 target(name='literal', sources=['b/c/f.txt'])
                 target(name='dot-slash', sources=['./b//c/f.txt'])
+                target(name='several', sources=['b/c/f.txt', 'b/c/g.txt'])
                 target(name='glob', sources=['b/*/f.txt'])
                 target(name='excluded', sources=['b/c/*.txt', '!b/c/f.txt'])
                 target(name='other-file', sources=['b/c/g.txt'])
@@ -1027,6 +1028,7 @@ def test_owners_in_ancestor_directories(owners_rule_runner: RuleRunner) -> None:
             Address("", target_name="root", relative_file_path="a/b/c/f.txt"),
             Address("a", target_name="literal"),
             Address("a", target_name="dot-slash"),
+            Address("a", target_name="several"),
             Address("a", target_name="glob"),
             Address("a", target_name="gen", relative_file_path="b/c/f.txt"),
             Address("a/b/c", target_name="here"),
@@ -1039,6 +1041,7 @@ def test_owners_in_ancestor_directories(owners_rule_runner: RuleRunner) -> None:
             Address("", target_name="root", relative_file_path="a/b/c/g.txt"),
             Address("", target_name="root", relative_file_path="a/x/f.txt"),
             Address("a", target_name="excluded"),
+            Address("a", target_name="several"),
             Address("a", target_name="other-file"),
             Address("a", target_name="gen", relative_file_path="b/c/g.txt"),
             Address("a/x", target_name="sibling", relative_file_path="f.txt"),
