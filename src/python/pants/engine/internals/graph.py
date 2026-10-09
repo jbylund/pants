@@ -1234,6 +1234,106 @@ def find_source_blocks_owners(
     return Owners(owners)
 
 
+@dataclass(frozen=True)
+class _BuildDirOwnersRequest:
+    """The targets declared in one directory's BUILD files (not its subdirectories')."""
+
+    directory: str
+
+
+@dataclass(frozen=True)
+class _BuildDirOwners:
+    """The targets declared in one directory's BUILD files, indexed by the files they can own.
+
+    Target generators are replaced by the targets they generate, as `resolve_targets` does, so most
+    targets (e.g. each generated single-file target) own a literal list of paths and are found with
+    a dict lookup. Only targets whose sources use globs or excludes are matched file by file.
+    """
+
+    by_file: FrozenDict[str, tuple[Address, ...]]
+    globbed: tuple[Target, ...]
+
+
+def _literal_source_paths(filespec: native_engine.Filespec) -> tuple[str, ...] | None:
+    """The paths that the filespec matches, or None unless it is a list of literal paths.
+
+    Mirrors how `FilespecMatcher` normalizes an include pattern: `.` and empty components are
+    dropped, and a pattern without glob characters then matches only itself.
+    """
+    if filespec.excludes:
+        return None
+    paths = []
+    for include in filespec.includes:
+        if any(c in include for c in "*?[\\"):
+            return None
+        parts = [part for part in include.split("/") if part not in ("", ".")]
+        if ".." in parts:
+            return None
+        paths.append("/".join(parts))
+    return tuple(paths)
+
+
+@rule(_masked_types=[EnvironmentName])
+async def get_build_dir_owners(
+    request: _BuildDirOwnersRequest,
+    target_types_to_generate_requests: TargetTypesToGenerateTargetsRequests,
+    local_environment_name: ChosenLocalEnvironmentName,
+) -> _BuildDirOwners:
+    address_family = (
+        await parse_address_family(**implicitly(AddressFamilyDir(request.directory)))
+    ).address_family
+    if address_family is None:
+        return _BuildDirOwners(FrozenDict(), ())
+    all_parametrizations = await concurrently(
+        resolve_target_parametrizations(
+            **implicitly(
+                {
+                    _TargetParametrizationsRequest(
+                        address, description_of_origin="<owners rule - cannot trigger>"
+                    ): _TargetParametrizationsRequest,
+                    local_environment_name.val: EnvironmentName,
+                }
+            )
+        )
+        for address in address_family.addresses_to_target_adaptors
+    )
+    by_file: DefaultDict[str, OrderedSet[Address]] = defaultdict(OrderedSet)
+    globbed: list[Target] = []
+    for parametrizations in all_parametrizations:
+        for parametrization in parametrizations:
+            # As in `resolve_targets`: a generator is replaced by the targets it generates.
+            original = parametrization.original_target
+            targets: Iterable[Target]
+            if (
+                original
+                and parametrization.parametrization
+                and target_types_to_generate_requests.is_generator(original)
+            ):
+                targets = parametrization.parametrization.values()
+            else:
+                targets = parametrization.all
+            for tgt in targets:
+                if not tgt.has_field(SourcesField):
+                    continue
+                paths = _literal_source_paths(tgt[SourcesField].filespec)
+                if paths is None:
+                    globbed.append(tgt)
+                    continue
+                for path in paths:
+                    by_file[path].add(tgt.address)
+    return _BuildDirOwners(
+        FrozenDict((path, tuple(addresses)) for path, addresses in by_file.items()),
+        tuple(globbed),
+    )
+
+
+def _dir_and_ancestors(directory: str) -> Iterator[str]:
+    yield directory
+    while directory:
+        directory = os.path.dirname(directory)
+        yield directory
+
+
 @rule(desc="Find which targets own certain files", _masked_types=[EnvironmentName])
 async def find_owners(
     owners_request: OwnersRequest,
@@ -1257,6 +1357,16 @@ async def find_owners(
     live_dirs = FrozenOrderedSet(os.path.dirname(s) for s in live_files)
     deleted_dirs = FrozenOrderedSet(os.path.dirname(s) for s in deleted_files)
 
+    # Unless targets must be filtered by the global options or matched by their BUILD file, live
+    # files' owners come from an index of each ancestor directory's targets, which every lookup
+    # under that directory shares, rather than from matching each file against every target
+    # declared in its directory and all ancestors.
+    index_live_files = not (
+        owners_request.filter_by_global_options
+        or owners_request.match_if_owning_build_file_included_in_sources
+    )
+    matched_live_dirs = FrozenOrderedSet() if index_live_files else live_dirs
+
     def create_live_and_deleted_gets(
         *, filter_by_global_options: bool
     ) -> tuple[
@@ -1272,7 +1382,7 @@ async def find_owners(
         We ignore unrecognized files, which can happen e.g. when finding owners for deleted files.
         """
         live_raw_specs = RawSpecsWithoutFileOwners(
-            ancestor_globs=tuple(AncestorGlobSpec(directory=d) for d in live_dirs),
+            ancestor_globs=tuple(AncestorGlobSpec(directory=d) for d in matched_live_dirs),
             filter_by_global_options=filter_by_global_options,
             description_of_origin="<owners rule - unused>",
             unmatched_glob_behavior=GlobMatchErrorBehavior.ignore,
@@ -1342,6 +1452,29 @@ async def find_owners(
 
             unmatched_sources -= matching_files
             result.add(candidate_tgt.address)
+
+    if index_live_files:
+        dirs = FrozenOrderedSet(
+            itertools.chain.from_iterable(_dir_and_ancestors(d) for d in live_dirs)
+        )
+        all_build_dir_owners = await concurrently(
+            get_build_dir_owners(_BuildDirOwnersRequest(d), **implicitly()) for d in dirs
+        )
+        build_dir_owners = dict(zip(dirs, all_build_dir_owners))
+        for f in live_files:
+            for d in _dir_and_ancestors(os.path.dirname(f)):
+                dir_owners = build_dir_owners[d]
+                addresses = [
+                    *dir_owners.by_file.get(f, ()),
+                    *(
+                        tgt.address
+                        for tgt in dir_owners.globbed
+                        if tgt[SourcesField].filespec_matcher.matches([f])
+                    ),
+                ]
+                if addresses:
+                    unmatched_sources.discard(f)
+                    result.update(addresses)
 
     if (
         unmatched_sources
