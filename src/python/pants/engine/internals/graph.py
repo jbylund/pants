@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import glob
 import itertools
 import json
 import logging
@@ -1235,53 +1236,26 @@ def find_source_blocks_owners(
 
 
 @dataclass(frozen=True)
-class _BuildDirOwnersRequest:
-    """The targets declared in one directory's BUILD files (not its subdirectories')."""
-
-    directory: str
-
-
-@dataclass(frozen=True)
 class _BuildDirOwners:
-    """The targets declared in one directory's BUILD files, indexed by the files they can own.
+    """The targets declared in one directory's BUILD files (not its subdirectories'), indexed by the
+    files they can own.
 
     Target generators are replaced by the targets they generate, as `resolve_targets` does, so most
-    targets (e.g. each generated single-file target) own a literal list of paths and are found with
-    a dict lookup. Only targets whose sources use globs or excludes are matched file by file.
+    targets are single-file targets. A target whose sources are all literal paths is found with a
+    dict lookup, and one that uses globs or excludes is matched file by file.
     """
 
     by_file: FrozenDict[str, tuple[Address, ...]]
     globbed: tuple[Target, ...]
 
 
-def _literal_source_paths(filespec: native_engine.Filespec) -> tuple[str, ...] | None:
-    """The paths that the filespec matches, or None unless it is a list of literal paths.
-
-    Mirrors how `FilespecMatcher` normalizes an include pattern: `.` and empty components are
-    dropped, and a pattern without glob characters then matches only itself.
-    """
-    if filespec.excludes:
-        return None
-    paths = []
-    for include in filespec.includes:
-        if any(c in include for c in "*?[\\"):
-            return None
-        parts = [part for part in include.split("/") if part not in ("", ".")]
-        if ".." in parts:
-            return None
-        paths.append("/".join(parts))
-    return tuple(paths)
-
-
 @rule(_masked_types=[EnvironmentName])
 async def get_build_dir_owners(
-    request: _BuildDirOwnersRequest,
+    request: AddressFamilyDir,
     target_types_to_generate_requests: TargetTypesToGenerateTargetsRequests,
     local_environment_name: ChosenLocalEnvironmentName,
 ) -> _BuildDirOwners:
-    address_family = (
-        await parse_address_family(**implicitly(AddressFamilyDir(request.directory)))
-    ).address_family
+    address_family = (await parse_address_family(**implicitly(request))).address_family
     if address_family is None:
         return _BuildDirOwners(FrozenDict(), ())
     all_parametrizations = await concurrently(
@@ -1315,12 +1289,12 @@ async def get_build_dir_owners(
             for tgt in targets:
                 if not tgt.has_field(SourcesField):
                     continue
-                paths = _literal_source_paths(tgt[SourcesField].filespec)
-                if paths is None:
+                filespec = tgt[SourcesField].filespec
+                if filespec.excludes or any(glob.has_magic(path) for path in filespec.includes):
                     globbed.append(tgt)
                     continue
-                for path in paths:
-                    by_file[path].add(tgt.address)
+                for path in filespec.includes:
+                    by_file[os.path.normpath(path)].add(tgt.address)
     return _BuildDirOwners(
         FrozenDict((path, tuple(addresses)) for path, addresses in by_file.items()),
         tuple(globbed),
@@ -1458,7 +1432,7 @@ async def find_owners(
             itertools.chain.from_iterable(_dir_and_ancestors(d) for d in live_dirs)
         )
         all_build_dir_owners = await concurrently(
-            get_build_dir_owners(_BuildDirOwnersRequest(d), **implicitly()) for d in dirs
+            get_build_dir_owners(AddressFamilyDir(d), **implicitly()) for d in dirs
         )
         build_dir_owners = dict(zip(dirs, all_build_dir_owners))
         for f in live_files:
