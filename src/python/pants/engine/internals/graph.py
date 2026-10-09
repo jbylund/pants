@@ -1251,13 +1251,10 @@ class _BuildDirOwners:
 
 @rule(_masked_types=[EnvironmentName])
 async def get_build_dir_owners(
-    request: AddressFamilyDir,
-    target_types_to_generate_requests: TargetTypesToGenerateTargetsRequests,
-    local_environment_name: ChosenLocalEnvironmentName,
+    request: AddressFamilyDir, local_environment_name: ChosenLocalEnvironmentName
 ) -> _BuildDirOwners:
     address_family = (await parse_address_family(**implicitly(request))).address_family
-    if address_family is None:
-        return _BuildDirOwners(FrozenDict(), ())
+    base_addresses = address_family.addresses_to_target_adaptors if address_family else ()
     all_parametrizations = await concurrently(
         resolve_target_parametrizations(
             **implicitly(
@@ -1269,24 +1266,15 @@ async def get_build_dir_owners(
                 }
             )
         )
-        for address in address_family.addresses_to_target_adaptors
+        for address in base_addresses
     )
-    by_file: DefaultDict[str, OrderedSet[Address]] = defaultdict(OrderedSet)
+    by_file: DefaultDict[str, list[Address]] = defaultdict(list)
     globbed: list[Target] = []
     for parametrizations in all_parametrizations:
         for parametrization in parametrizations:
-            # As in `resolve_targets`: a generator is replaced by the targets it generates.
-            original = parametrization.original_target
-            targets: Iterable[Target]
-            if (
-                original
-                and parametrization.parametrization
-                and target_types_to_generate_requests.is_generator(original)
-            ):
-                targets = parametrization.parametrization.values()
-            else:
-                targets = parametrization.all
-            for tgt in targets:
+            # As in `resolve_targets`, a generator is replaced by the targets it generates.
+            generated = parametrization.parametrization
+            for tgt in generated.values() if generated else parametrization.all:
                 if not tgt.has_field(SourcesField):
                     continue
                 filespec = tgt[SourcesField].filespec
@@ -1294,7 +1282,7 @@ async def get_build_dir_owners(
                     globbed.append(tgt)
                     continue
                 for path in filespec.includes:
-                    by_file[os.path.normpath(path)].add(tgt.address)
+                    by_file[os.path.normpath(path)].append(tgt.address)
     return _BuildDirOwners(
         FrozenDict((path, tuple(addresses)) for path, addresses in by_file.items()),
         tuple(globbed),
@@ -1332,9 +1320,7 @@ async def find_owners(
     deleted_dirs = FrozenOrderedSet(os.path.dirname(s) for s in deleted_files)
 
     # Unless targets must be filtered by the global options or matched by their BUILD file, live
-    # files' owners come from an index of each ancestor directory's targets, which every lookup
-    # under that directory shares, rather than from matching each file against every target
-    # declared in its directory and all ancestors.
+    # files' owners come from an index of each ancestor directory's targets, shared by every lookup.
     index_live_files = not (
         owners_request.filter_by_global_options
         or owners_request.match_if_owning_build_file_included_in_sources
