@@ -23,7 +23,7 @@ from pants.option.subsystem import Subsystem
 from pants.util.docutil import doc_url
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
-from pants.util.memo import memoized_method
+from pants.util.memo import memoized_method, memoized_property
 from pants.util.strutil import softwrap
 
 logger = logging.getLogger(__name__)
@@ -83,12 +83,37 @@ class SourceRootPatternMatcher:
     def get_patterns(self) -> tuple[str, ...]:
         return tuple(self.root_patterns)
 
+    @memoized_property
+    def _compiled_patterns(
+        self,
+    ) -> tuple[frozenset[tuple[str, ...]], tuple[tuple[str, ...], ...], tuple[str, ...]]:
+        """The patterns without wildcards as the parts of the paths they match exactly (absolute
+        patterns) or as a suffix (relative patterns), and the patterns with wildcards."""
+        absolute = set()
+        relative = []
+        wildcard = []
+        for pattern in self.root_patterns:
+            if any(c in pattern for c in "*?["):
+                wildcard.append(pattern)
+                continue
+            parts = PurePath(pattern).parts
+            if PurePath(pattern).is_absolute():
+                absolute.add(parts)
+            else:
+                relative.append(parts)
+        return frozenset(absolute), tuple(relative), tuple(wildcard)
+
     def matches_root_patterns(self, relpath: PurePath) -> bool:
         """Does this putative root match a pattern?"""
-        # Note: This is currently O(n) where n is the number of patterns, which
-        # we expect to be small.  We can optimize if it becomes necessary.
         putative_root = _repo_root / relpath
-        for pattern in self.root_patterns:
+        parts = putative_root.parts
+        absolute, relative, wildcard = self._compiled_patterns
+        if parts in absolute:
+            return True
+        for pattern_parts in relative:
+            if len(pattern_parts) <= len(parts) and parts[-len(pattern_parts) :] == pattern_parts:
+                return True
+        for pattern in wildcard:
             if putative_root.match(pattern):
                 return True
         return False

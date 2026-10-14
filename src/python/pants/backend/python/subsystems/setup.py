@@ -1029,6 +1029,13 @@ class PythonSetup(Subsystem):
     def scratch_dir(self):
         return os.path.join(self.options.pants_workdir, *self.options_scope.split("."))
 
+    def is_known_resolve(self, resolve: str) -> bool:
+        resolve_names = self.__dict__.get("_resolve_names")
+        if resolve_names is None:
+            resolve_names = frozenset(self.resolves)
+            self.__dict__["_resolve_names"] = resolve_names
+        return resolve in resolve_names
+
     def compatibility_or_constraints(
         self, compatibility: Iterable[str] | None, resolve: str | None
     ) -> tuple[str, ...]:
@@ -1036,6 +1043,20 @@ class PythonSetup(Subsystem):
 
         If interpreter constraints are supplied by the CLI flag, return those only.
         """
+        # A function of the options, which are fixed for this instance.
+        cache: dict[tuple[tuple[str, ...] | None, str | None], tuple[str, ...]] = (
+            self.__dict__.setdefault("_compatibility_or_constraints_cache", {})
+        )
+        key = (tuple(compatibility) if compatibility else None, resolve)
+        result = cache.get(key)
+        if result is None:
+            result = self._compatibility_or_constraints(compatibility, resolve)
+            cache[key] = result
+        return result
+
+    def _compatibility_or_constraints(
+        self, compatibility: Iterable[str] | None, resolve: str | None
+    ) -> tuple[str, ...]:
         if self.options.is_flagged("interpreter_constraints"):
             return self.interpreter_constraints
         if compatibility:
