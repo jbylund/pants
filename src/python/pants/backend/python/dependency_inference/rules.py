@@ -17,6 +17,7 @@ from pants.backend.python.dependency_inference.default_unowned_dependencies impo
 from pants.backend.python.dependency_inference.module_mapper import (
     AllPythonTargets,
     PythonModuleOwners,
+    PythonModuleOwnersLookup,
     PythonModuleOwnersRequest,
     ResolveName,
     map_module_to_address,
@@ -434,6 +435,7 @@ class ResolvedParsedPythonDependencies:
 async def resolve_parsed_dependencies(
     request: ResolvedParsedPythonDependenciesRequest,
     python_infer_subsystem: PythonInferSubsystem,
+    module_owners_lookup: PythonModuleOwnersLookup,
 ) -> ResolvedParsedPythonDependencies:
     """Find the owning targets for the parsed dependencies."""
 
@@ -457,13 +459,12 @@ async def resolve_parsed_dependencies(
         locality = source_root.path
 
     if parsed_imports:
-        owners_per_import = await concurrently(
-            map_module_to_address(
-                PythonModuleOwnersRequest(imported_module, request.resolve, locality),
-                **implicitly(),
+        owners_per_import = [
+            module_owners_lookup.owners(
+                PythonModuleOwnersRequest(imported_module, request.resolve, locality)
             )
             for imported_module in parsed_imports
-        )
+        ]
         resolve_results = _get_imports_info(
             address=request.field_set.address,
             owners_per_import=owners_per_import,
