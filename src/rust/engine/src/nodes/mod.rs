@@ -23,7 +23,7 @@ use rule_graph::{DependencyKey, Query};
 use store::{self, StoreFileByDigest};
 use workunit_store::{Level, in_workunit};
 
-use crate::context::{Context, SessionCore};
+use crate::context::{Context, Core, SessionCore};
 use crate::externs;
 use crate::externs::engine_aware::{EngineAwareParameter, EngineAwareReturnType};
 use crate::python::{Failure, Key, Params, TypeId, Value, display_sorted_in_parens, throw};
@@ -70,6 +70,39 @@ pub fn task_side_effected() -> Result<(), String> {
             acquired via parameters to `@rule`s."
                 .to_owned()
         })
+}
+
+/// Runs `f` attached to Python while holding a permit of the engine's Python gate, if there is one.
+///
+/// The permit is held only for the synchronous step, never across an await, so a holder cannot wait
+/// on work that needs another permit. Side-effecting tasks bypass the gate: they may block in a
+/// step on engine work (e.g. an interactive process) that itself runs Python.
+pub(crate) async fn attach_gated<R>(core: &Core, f: impl FnOnce(Python<'_>) -> R) -> R {
+    let gate = match &core.python_gate {
+        Some(gate) if TASK_SIDE_EFFECTED.try_with(|_| ()).is_err() => gate,
+        _ => return Python::attach(f),
+    };
+    let permit = gate.acquire().await.expect("The Python gate is never closed.");
+    let result = Python::attach(f);
+    drop(permit);
+    if gate.available_permits() == 0 {
+        // The permit went straight to a waiter, which tokio woke into this worker's LIFO slot, where
+        // no other worker can steal it: yield once, so that its Python step runs before (rather than
+        // after) the engine work that follows ours. (Rescheduled after a yield, this task can be
+        // stolen by an idle worker.)
+        let mut yielded = false;
+        futures::future::poll_fn(|cx| {
+            if yielded {
+                std::task::Poll::Ready(())
+            } else {
+                yielded = true;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+    }
+    result
 }
 
 pub fn task_get_context() -> Context {
@@ -237,17 +270,23 @@ pub fn lift_file_digest(digest: &Bound<'_, PyAny>) -> Result<hashing::Digest, St
 }
 
 pub fn unmatched_globs_additional_context() -> Option<String> {
-    let url = Python::attach(|py| {
-        externs::doc_url(
-            py,
-            "docs/using-pants/troubleshooting-common-issues#pants-cannot-find-a-file-in-your-project",
-        )
-    });
-    Some(format!(
-        "\n\nDo the file(s) exist? If so, check if the file(s) are in your `.gitignore` or the global \
+    // Constant for the process, but requested by every glob expansion (whether or not it fails),
+    // so computed once rather than attaching to Python each time.
+    static CONTEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let context = CONTEXT.get_or_init(|| {
+        let url = Python::attach(|py| {
+            externs::doc_url(
+                py,
+                "docs/using-pants/troubleshooting-common-issues#pants-cannot-find-a-file-in-your-project",
+            )
+        });
+        format!(
+            "\n\nDo the file(s) exist? If so, check if the file(s) are in your `.gitignore` or the global \
     `pants_ignore` option, which may result in Pants not being able to see the file(s) even though \
     they exist on disk. Refer to {url}."
-    ))
+        )
+    });
+    Some(context.clone())
 }
 
 ///
@@ -397,28 +436,29 @@ impl NodeKey {
     /// `Node`s need a user-facing name. For `Node`s derived from Python `@rule`s, the
     /// user-facing name should be the same as the `desc` annotation on the rule decorator.
     ///
+    fn task_workunit_desc(context: &Context, task_desc: &str, params: &Params) -> String {
+        let displayable_param_names: Vec<_> = Python::attach(|py| {
+            Self::engine_aware_params(context, py, params)
+                .filter_map(|k| EngineAwareParameter::debug_hint(k.value.bind(py)))
+                .collect()
+        });
+
+        if displayable_param_names.is_empty() {
+            task_desc.to_owned()
+        } else {
+            format!(
+                "{} - {}",
+                task_desc,
+                display_sorted_in_parens(displayable_param_names.iter())
+            )
+        }
+    }
+
     fn workunit_desc(&self, context: &Context) -> Option<String> {
         match self {
             NodeKey::Task(task) => {
-                let task_desc = task.task.display_info.desc.as_ref().map(|s| s.to_owned())?;
-
-                let displayable_param_names: Vec<_> = Python::attach(|py| {
-                    Self::engine_aware_params(context, py, &task.params)
-                        .filter_map(|k| EngineAwareParameter::debug_hint(k.value.bind(py)))
-                        .collect()
-                });
-
-                let desc = if displayable_param_names.is_empty() {
-                    task_desc
-                } else {
-                    format!(
-                        "{} - {}",
-                        task_desc,
-                        display_sorted_in_parens(displayable_param_names.iter())
-                    )
-                };
-
-                Some(desc)
+                let task_desc = task.task.display_info.desc.as_ref()?;
+                Some(Self::task_workunit_desc(context, task_desc, &task.params))
             }
             NodeKey::Snapshot(s) => Some(format!("Snapshotting: {}", s.path_globs)),
             NodeKey::ExecuteProcess(epr) => {
@@ -495,7 +535,23 @@ impl Node for NodeKey {
 
     async fn run(self, context: Context) -> Result<NodeOutput, Failure> {
         let workunit_name = self.workunit_name();
-        let workunit_desc = self.workunit_desc(&context);
+        // A Task's description attaches to Python to render its params, so it is only computed
+        // when its workunit is recorded, or when it fails. Other descriptions are cheap.
+        let (eager_desc, task_desc_inputs) = match &self {
+            NodeKey::Task(task) => (
+                None,
+                task.task
+                    .display_info
+                    .desc
+                    .clone()
+                    .map(|desc| (desc, task.params.clone())),
+            ),
+            _ => (self.workunit_desc(&context), None),
+        };
+        let workunit_desc = |context: &Context| match &task_desc_inputs {
+            Some((desc, params)) => Some(Self::task_workunit_desc(context, desc, params)),
+            None => eager_desc.clone(),
+        };
         let maybe_params = match &self {
             NodeKey::Task(task) => Some(&task.params),
             _ => None,
@@ -505,7 +561,7 @@ impl Node for NodeKey {
         in_workunit!(
             workunit_name,
             self.workunit_level(),
-            desc = workunit_desc.clone(),
+            desc = workunit_desc(&context),
             user_metadata = {
                 if let Some(params) = maybe_params {
                     Python::attach(|py| {
@@ -565,8 +621,9 @@ impl Node for NodeKey {
                 }
 
                 // If the node failed, expand the Failure with a new frame.
-                result = result
-                    .map_err(|failure| failure.with_pushed_frame(workunit_name, workunit_desc));
+                result = result.map_err(|failure| {
+                    failure.with_pushed_frame(workunit_name, workunit_desc(&context2))
+                });
 
                 result
             }

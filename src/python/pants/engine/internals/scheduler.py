@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
@@ -235,6 +236,11 @@ class Scheduler:
             child_max_memory=execution_options.process_total_child_memory_usage or 0,
             child_default_memory=execution_options.process_per_child_memory_usage,
             graceful_shutdown_timeout=execution_options.process_execution_graceful_shutdown_timeout,
+            python_concurrency=(
+                execution_options.rule_python_concurrency
+                if execution_options.rule_python_concurrency is not None
+                else (1 if getattr(sys, "_is_gil_enabled", lambda: True)() else 0)
+            ),
         )
 
         self._py_executor = executor
