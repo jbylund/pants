@@ -33,6 +33,7 @@ from pants.backend.python.dependency_inference.module_mapper import (
     ModuleProviderType,
     PossibleModuleProvider,
     PythonModuleOwners,
+    PythonModuleOwnersLookup,
     PythonModuleOwnersRequest,
     ThirdPartyPythonModuleMapping,
     generate_mappings_from_pattern,
@@ -269,6 +270,7 @@ def rule_runner() -> RuleRunner:
             QueryRule(FirstPartyPythonModuleMapping, []),
             QueryRule(ThirdPartyPythonModuleMapping, []),
             QueryRule(PythonModuleOwners, [PythonModuleOwnersRequest]),
+            QueryRule(PythonModuleOwnersLookup, []),
         ],
         target_types=[
             PythonSourceTarget,
@@ -891,6 +893,26 @@ def test_resolving_ambiguity_by_filesystem_proximity(rule_runner: RuleRunner) ->
         Address("root1/aa/bb", relative_file_path="foo.py"),
         Address("root2/aa/bb", relative_file_path="foo.py"),
     ]
+
+
+def test_module_owners_lookup_follows_mapping_changes(rule_runner: RuleRunner) -> None:
+    # The lookup memoizes owners, so when the module mappings change (as files change under
+    # pantsd), a new lookup must replace it rather than keep answering from a stale memo.
+    rule_runner.set_options(["--source-root-patterns=['src']"])
+    rule_runner.write_files({"src/aa/BUILD": "python_sources()", "src/aa/foo.py": ""})
+    request = PythonModuleOwnersRequest("aa.bar", None)
+
+    lookup = rule_runner.request(PythonModuleOwnersLookup, [])
+    owners = lookup.owners(request)
+    assert (list(owners.unambiguous), list(owners.ambiguous)) == ([], [])
+    assert lookup.owners(request) is owners
+
+    rule_runner.write_files({"src/aa/bar.py": ""})
+    bar = Address("src/aa", relative_file_path="bar.py")
+    assert list(rule_runner.request(PythonModuleOwnersLookup, []).owners(request).unambiguous) == [
+        bar
+    ]
+    assert list(rule_runner.request(PythonModuleOwners, [request]).unambiguous) == [bar]
 
 
 def test_map_module_considers_resolves(rule_runner: RuleRunner) -> None:
