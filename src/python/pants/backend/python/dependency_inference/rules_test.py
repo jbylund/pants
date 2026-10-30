@@ -908,6 +908,43 @@ def test_infer_python_identical_files_with_relative_imports_should_be_treated_di
     )
 
 
+def test_infer_python_imports_falls_back_from_directory_parsing(
+    imports_rule_runner: PythonRuleRunner,
+) -> None:
+    # A directory's Python files are parsed together. A file that isn't part of that batch, or a
+    # directory whose batch fails to parse, falls back to parsing each file on its own.
+    imports_rule_runner.write_files(
+        {
+            "src/BUILD": dedent(
+                """\
+                python_sources(name="lib")
+                python_source(name="script", source="script")
+                """
+            ),
+            "src/lib.py": "",
+            "src/user.py": "import lib\n",
+            # Not matched by the directory's `*.py` glob.
+            "src/script": "import lib\n",
+            # Not UTF-8, so the directory's batch fails to parse.
+            "src/latin1.py": b"# caf\xe9\nimport lib\n",
+        }
+    )
+
+    def infer(address: Address) -> InferredDependencies:
+        tgt = imports_rule_runner.get_target(address)
+        return imports_rule_runner.request(
+            InferredDependencies,
+            [InferPythonImportDependencies(PythonImportDependenciesInferenceFieldSet.create(tgt))],
+        )
+
+    lib = InferredDependencies([Address("src", target_name="lib", relative_file_path="lib.py")])
+    assert infer(Address("src", target_name="lib", relative_file_path="user.py")) == lib
+    assert infer(Address("src", target_name="script")) == lib
+    # The file that can't be parsed fails on its own, as it does when parsed alone.
+    with engine_error(contains="utf-8"):
+        infer(Address("src", target_name="lib", relative_file_path="latin1.py"))
+
+
 class TestCategoriseImportsInfo:
     address = Address("sample/path")
     import_cases = {
