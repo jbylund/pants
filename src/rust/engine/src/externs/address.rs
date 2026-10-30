@@ -438,7 +438,7 @@ fn split_on_longest_dir_prefix<'a, 'b>(
 }
 
 #[pyclass(name = "Address", frozen, from_py_object)]
-#[derive(Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Eq, Ord, PartialOrd)]
 pub struct Address {
     // NB: Field ordering is deliberate, so that Ord will roughly match `self.spec`.
     spec_path: PathBuf,
@@ -446,6 +446,63 @@ pub struct Address {
     target_name: Option<String>,
     parameters: BTreeMap<String, String>,
     generated_name: Option<String>,
+    // The hash of the fields above, computed once: hashing a `PathBuf` walks its components, and
+    // addresses are hashed on every lookup in a Python dict or set. Last, so that it only affects
+    // the derived `Ord` of addresses whose other fields are equal (and so is equal too).
+    hash: u64,
+}
+
+impl Address {
+    fn from_parts(
+        spec_path: PathBuf,
+        relative_file_path: Option<PathBuf>,
+        target_name: Option<String>,
+        parameters: BTreeMap<String, String>,
+        generated_name: Option<String>,
+    ) -> Self {
+        // The same value a derived `Hash` fed to `FnvHasher` produced: Python-visible hashes are
+        // unchanged.
+        let mut hasher = FnvHasher::default();
+        spec_path.hash(&mut hasher);
+        relative_file_path.hash(&mut hasher);
+        target_name.hash(&mut hasher);
+        parameters.hash(&mut hasher);
+        generated_name.hash(&mut hasher);
+        Self {
+            spec_path,
+            relative_file_path,
+            target_name,
+            parameters,
+            generated_name,
+            hash: hasher.finish(),
+        }
+    }
+}
+
+impl std::hash::Hash for Address {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+/// Path equality, trying the (common) case of identical bytes before comparing components.
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    a.as_os_str() == b.as_os_str() || a == b
+}
+
+impl PartialEq for Address {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash
+            && paths_equal(&self.spec_path, &other.spec_path)
+            && match (&self.relative_file_path, &other.relative_file_path) {
+                (Some(a), Some(b)) => paths_equal(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+            && self.target_name == other.target_name
+            && self.parameters == other.parameters
+            && self.generated_name == other.generated_name
+    }
 }
 
 #[pymethods]
@@ -515,13 +572,13 @@ impl Address {
             None
         };
 
-        let address = Self {
+        let address = Self::from_parts(
             spec_path,
-            target_name,
-            parameters: parameters.unwrap_or_default(),
-            generated_name,
             relative_file_path,
-        };
+            target_name,
+            parameters.unwrap_or_default(),
+            generated_name,
+        );
 
         if let Some(file_name) = address.spec_path.file_name().and_then(|n| n.to_str())
             && file_name.starts_with("BUILD")
@@ -759,13 +816,13 @@ impl Address {
             merged_parameters
         };
 
-        Self {
-            spec_path: self.spec_path.clone(),
-            target_name: self.target_name.clone(),
-            parameters: merged_parameters,
-            generated_name: self.generated_name.clone(),
-            relative_file_path: self.relative_file_path.clone(),
-        }
+        Self::from_parts(
+            self.spec_path.clone(),
+            self.relative_file_path.clone(),
+            self.target_name.clone(),
+            merged_parameters,
+            self.generated_name.clone(),
+        )
     }
 
     fn maybe_convert_to_target_generator(self_: PyRef<Self>, py: Python) -> PyResult<Py<PyAny>> {
@@ -773,13 +830,13 @@ impl Address {
             return Ok(self_.into_pyobject(py)?.into_any().unbind());
         }
 
-        Ok(Self {
-            spec_path: self_.spec_path.clone(),
-            target_name: self_.target_name.clone(),
-            parameters: BTreeMap::default(),
-            generated_name: None,
-            relative_file_path: None,
-        }
+        Ok(Self::from_parts(
+            self_.spec_path.clone(),
+            None,
+            self_.target_name.clone(),
+            BTreeMap::default(),
+            None,
+        )
         .into_pyobject(py)?
         .into_any()
         .unbind())
@@ -792,13 +849,13 @@ impl Address {
             )));
         }
 
-        Ok(Self {
-            spec_path: self.spec_path.clone(),
-            target_name: self.target_name.clone(),
-            parameters: self.parameters.clone(),
-            generated_name: Some(generated_name),
-            relative_file_path: None,
-        })
+        Ok(Self::from_parts(
+            self.spec_path.clone(),
+            None,
+            self.target_name.clone(),
+            self.parameters.clone(),
+            Some(generated_name),
+        ))
     }
 
     fn create_file(&self, relative_file_path: PathBuf) -> PyResult<Self> {
@@ -808,13 +865,13 @@ impl Address {
             )));
         }
 
-        Ok(Self {
-            spec_path: self.spec_path.clone(),
-            target_name: self.target_name.clone(),
-            parameters: self.parameters.clone(),
-            generated_name: None,
-            relative_file_path: Some(relative_file_path),
-        })
+        Ok(Self::from_parts(
+            self.spec_path.clone(),
+            Some(relative_file_path),
+            self.target_name.clone(),
+            self.parameters.clone(),
+            None,
+        ))
     }
 
     fn debug_hint(&self) -> String {
@@ -828,9 +885,7 @@ impl Address {
     }
 
     fn __hash__(&self) -> u64 {
-        let mut s = FnvHasher::default();
-        self.hash(&mut s);
-        s.finish()
+        self.hash
     }
 
     fn __str__(&self) -> String {
@@ -842,7 +897,13 @@ impl Address {
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
-        op.matches(self.cmp(other))
+        match op {
+            // Most comparisons are equality checks (dict and set lookups): those don't need to
+            // order paths component by component.
+            CompareOp::Eq => self == other,
+            CompareOp::Ne => self != other,
+            _ => op.matches(self.cmp(other)),
+        }
     }
 }
 
