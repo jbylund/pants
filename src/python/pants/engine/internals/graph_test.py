@@ -16,9 +16,10 @@ import pytest
 from pants.base.deprecated import warn_or_error
 from pants.base.specs import Specs
 from pants.base.specs_parser import SpecsParser
+from pants.build_graph.address import ResolveError
 from pants.engine.addresses import Address, Addresses, AddressInput, UnparsedAddressInputs
 from pants.engine.environment import EnvironmentName
-from pants.engine.fs import CreateDigest, FileContent
+from pants.engine.fs import CreateDigest, FileContent, GlobMatchErrorBehavior
 from pants.engine.internals.build_files import resolve_address
 from pants.engine.internals.graph import (
     AmbiguousCodegenImplementationsException,
@@ -838,6 +839,7 @@ def owners_rule_runner() -> RuleRunner:
             MockTargetGenerator,
             MockGeneratedTarget,
         ],
+        objects={"parametrize": Parametrize},
         # NB: The `graph` module masks the environment is most/all positions. We disable the
         # inherent environment so that the positions which do require the environment are
         # highlighted.
@@ -852,16 +854,24 @@ def assert_owners(
     expected: set[Address],
     match_if_owning_build_file_included_in_sources: bool = False,
 ) -> None:
-    result = rule_runner.request(
-        Owners,
-        [
-            OwnersRequest(
-                tuple(requested),
-                match_if_owning_build_file_included_in_sources=match_if_owning_build_file_included_in_sources,
+    def owners(filter_by_global_options: bool) -> set[Address]:
+        return set(
+            rule_runner.request(
+                Owners,
+                [
+                    OwnersRequest(
+                        tuple(requested),
+                        filter_by_global_options=filter_by_global_options,
+                        match_if_owning_build_file_included_in_sources=match_if_owning_build_file_included_in_sources,
+                    )
+                ],
             )
-        ],
-    )
-    assert set(result) == expected
+        )
+
+    assert owners(filter_by_global_options=False) == expected
+    # No global filtering options are set, so filtering doesn't change the owners. But it does
+    # bypass the per-directory index for live files, matching every candidate target instead.
+    assert owners(filter_by_global_options=True) == expected
 
 
 def test_owners_source_file_does_not_exist(owners_rule_runner: RuleRunner) -> None:
@@ -982,6 +992,110 @@ def test_owners_build_file(owners_rule_runner: RuleRunner) -> None:
             Address("demo", target_name="generated", relative_file_path="f2.txt"),
         },
     )
+
+
+def test_owners_in_ancestor_directories(owners_rule_runner: RuleRunner) -> None:
+    """Targets declared in the file's directory or any ancestor can own it; others can't."""
+    owners_rule_runner.write_files(
+        {
+            "BUILD": "generator(name='root', sources=['**/*.txt'])",
+            "a/BUILD": dedent(
+                """\
+                target(name='literal', sources=['b/c/f.txt'])
+                target(name='dot-slash', sources=['./b//c/f.txt'])
+                target(name='several', sources=['b/c/f.txt', 'b/c/g.txt'])
+                target(name='glob', sources=['b/*/f.txt'])
+                target(name='excluded', sources=['b/c/*.txt', '!b/c/f.txt'])
+                target(name='other-file', sources=['b/c/g.txt'])
+                generator(name='gen', sources=['b/**/*.txt'])
+                generator(name='gen-no-files', sources=['*.md'])
+                target(name='no-sources')
+                """
+            ),
+            "a/b/c/f.txt": "",
+            "a/b/c/g.txt": "",
+            "a/b/c/BUILD": "target(name='here', sources=['f.txt'])",
+            "a/b/c/d/BUILD": "generator(name='below', sources=['*.txt'])",
+            "a/b/c/d/f.txt": "",
+            "a/x/BUILD": "generator(name='sibling', sources=['*.txt'])",
+            "a/x/f.txt": "",
+        }
+    )
+    assert_owners(
+        owners_rule_runner,
+        ["a/b/c/f.txt"],
+        expected={
+            Address("", target_name="root", relative_file_path="a/b/c/f.txt"),
+            Address("a", target_name="literal"),
+            Address("a", target_name="dot-slash"),
+            Address("a", target_name="several"),
+            Address("a", target_name="glob"),
+            Address("a", target_name="gen", relative_file_path="b/c/f.txt"),
+            Address("a/b/c", target_name="here"),
+        },
+    )
+    assert_owners(
+        owners_rule_runner,
+        ["a/b/c/g.txt", "a/x/f.txt"],
+        expected={
+            Address("", target_name="root", relative_file_path="a/b/c/g.txt"),
+            Address("", target_name="root", relative_file_path="a/x/f.txt"),
+            Address("a", target_name="excluded"),
+            Address("a", target_name="several"),
+            Address("a", target_name="other-file"),
+            Address("a", target_name="gen", relative_file_path="b/c/g.txt"),
+            Address("a/x", target_name="sibling", relative_file_path="f.txt"),
+        },
+    )
+
+
+def test_owners_parametrized(owners_rule_runner: RuleRunner) -> None:
+    owners_rule_runner.write_files(
+        {
+            "demo/f.txt": "",
+            "demo/BUILD": dedent(
+                """\
+                target(name='t', sources=['f.txt'], resolve=parametrize('a', 'b'))
+                generator(name='gen', sources=['*.txt'], resolve=parametrize('a', 'b'))
+                """
+            ),
+        }
+    )
+    assert_owners(
+        owners_rule_runner,
+        ["demo/f.txt"],
+        expected={
+            Address("demo", target_name="t", parameters={"resolve": "a"}),
+            Address("demo", target_name="t", parameters={"resolve": "b"}),
+            Address(
+                "demo", target_name="gen", relative_file_path="f.txt", parameters={"resolve": "a"}
+            ),
+            Address(
+                "demo", target_name="gen", relative_file_path="f.txt", parameters={"resolve": "b"}
+            ),
+        },
+    )
+
+
+def test_owners_not_found(owners_rule_runner: RuleRunner) -> None:
+    owners_rule_runner.write_files(
+        {
+            "demo/f.txt": "",
+            "demo/unowned.txt": "",
+            "demo/BUILD": "target(name='t', sources=['f.txt'])",
+        }
+    )
+    assert_owners(owners_rule_runner, ["demo/unowned.txt"], expected=set())
+    with engine_error(ResolveError, contains="demo/unowned.txt"):
+        owners_rule_runner.request(
+            Owners,
+            [
+                OwnersRequest(
+                    ("demo/f.txt", "demo/unowned.txt"),
+                    owners_not_found_behavior=GlobMatchErrorBehavior.error,
+                )
+            ],
+        )
 
 
 # -----------------------------------------------------------------------------------------------
