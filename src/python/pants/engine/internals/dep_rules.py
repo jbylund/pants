@@ -92,6 +92,21 @@ class BuildFileDependencyRules(ABC):
         path: str, parent: BuildFileDependencyRules | None
     ) -> BuildFileDependencyRulesParserState: ...
 
+    @classmethod
+    def dependency_rule_action(
+        cls,
+        *,
+        origin_address: Address,
+        origin_adaptor: TargetAdaptor,
+        dependencies_rules: BuildFileDependencyRules | None,
+        dependency_address: Address,
+        dependency_adaptor: TargetAdaptor,
+        dependents_rules: BuildFileDependencyRules | None,
+    ) -> DependencyRuleAction | None:
+        """The action of the rule application `check_dependency_rules` returns, which may be cheaper
+        to compute; None if `check_dependency_rules` should be called (e.g. because it raises)."""
+        return None
+
     @staticmethod
     @abstractmethod
     def check_dependency_rules(

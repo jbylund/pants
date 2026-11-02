@@ -25,6 +25,8 @@ from pants.util.strutil import softwrap
 
 logger = logging.getLogger(__name__)
 
+_ADDRESS_RELPATH_CACHE: dict[Address, str] = {}
+
 
 class BuildFileVisibilityRulesError(DependencyRulesError):
     @classmethod
@@ -198,6 +200,44 @@ class BuildFileVisibilityRules(BuildFileDependencyRules):
         return BuildFileVisibilityRulesParserState(path, cast(BuildFileVisibilityRules, parent))
 
     @classmethod
+    def dependency_rule_action(
+        cls,
+        *,
+        origin_address: Address,
+        origin_adaptor: TargetAdaptor,
+        dependencies_rules: BuildFileDependencyRules | None,
+        dependency_address: Address,
+        dependency_adaptor: TargetAdaptor,
+        dependents_rules: BuildFileDependencyRules | None,
+    ) -> DependencyRuleAction | None:
+        """The action `check_dependency_rules` would return, or None if it would raise."""
+        out_action = (
+            cast(BuildFileVisibilityRules, dependencies_rules).get_action(
+                address=origin_address,
+                adaptor=origin_adaptor,
+                other_address=dependency_address,
+                other_adaptor=dependency_adaptor,
+            )[1]
+            if dependencies_rules is not None
+            else DependencyRuleAction.ALLOW
+        )
+        in_action = (
+            cast(BuildFileVisibilityRules, dependents_rules).get_action(
+                address=dependency_address,
+                adaptor=dependency_adaptor,
+                other_address=origin_address,
+                other_adaptor=origin_adaptor,
+            )[1]
+            if dependents_rules is not None
+            else DependencyRuleAction.ALLOW
+        )
+        if out_action is None or in_action is None:
+            return None
+        if in_action is DependencyRuleAction.DENY or out_action is DependencyRuleAction.ALLOW:
+            return in_action
+        return out_action
+
+    @classmethod
     def check_dependency_rules(
         cls,
         *,
@@ -279,9 +319,12 @@ class BuildFileVisibilityRules(BuildFileDependencyRules):
 
     @staticmethod
     def _get_address_relpath(address: Address) -> str:
-        if address.is_file_target:
-            return os.path.dirname(address.filename)
-        return address.spec_path
+        relpath = _ADDRESS_RELPATH_CACHE.get(address)
+        if relpath is None:
+            relpath = _ADDRESS_RELPATH_CACHE[address] = (
+                os.path.dirname(address.filename) if address.is_file_target else address.spec_path
+            )
+        return relpath
 
     @staticmethod
     def _get_address_path(address: Address) -> str:
@@ -302,6 +345,48 @@ class BuildFileVisibilityRules(BuildFileDependencyRules):
         ruleset = self.get_ruleset(address, adaptor, relpath)
         if ruleset is None:
             return None, None, None
+        first_rule = ruleset.rules[0] if ruleset.rules else None
+        if (
+            first_rule is not None
+            and first_rule.action is DependencyRuleAction.ALLOW
+            and first_rule.glob.matches_everything
+        ):
+            allow_all = self._cache("_allow_all_actions")
+            result = allow_all.get(id(ruleset))
+            if result is None:
+                result = allow_all[id(ruleset)] = (ruleset, first_rule.action, str(first_rule))
+            return result
+        # Which rule applies depends only on the ruleset, the other target and `relpath`, and
+        # many targets in a directory share all three.
+        cache = self._cache("_action_cache")
+        key = (id(ruleset), other_address, relpath)
+        cached = cache.get(key)
+        if cached is not None and cached[0] is other_adaptor:
+            return cast(
+                tuple[VisibilityRuleSet | None, DependencyRuleAction | None, str | None], cached[1]
+            )
+        result = self._get_action_uncached(
+            ruleset, address, adaptor, relpath, other_address, other_adaptor
+        )
+        cache[key] = (other_adaptor, result)
+        return result
+
+    def _cache(self, name: str) -> dict:
+        cache = self.__dict__.get(name)
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, name, cache)
+        return cache
+
+    def _get_action_uncached(
+        self,
+        ruleset: VisibilityRuleSet,
+        address: Address,
+        adaptor: TargetAdaptor,
+        relpath: str,
+        other_address: Address,
+        other_adaptor: TargetAdaptor,
+    ) -> tuple[VisibilityRuleSet | None, DependencyRuleAction | None, str | None]:
         for visibility_rule in ruleset.rules:
             if visibility_rule.match(other_address, other_adaptor, relpath):
                 if visibility_rule.action != DependencyRuleAction.ALLOW:
@@ -324,10 +409,16 @@ class BuildFileVisibilityRules(BuildFileDependencyRules):
     ) -> VisibilityRuleSet | None:
         if relpath is None:
             relpath = self._get_address_relpath(address)
-        for ruleset in self.rulesets:
-            if ruleset.match(address, target, relpath):
-                return ruleset
-        return None
+        cache = self._cache("_ruleset_cache")
+        key = (address, relpath)
+        cached = cache.get(key)
+        if cached is not None and cached[0] is target:
+            return cast(VisibilityRuleSet | None, cached[1])
+        result = next(
+            (ruleset for ruleset in self.rulesets if ruleset.match(address, target, relpath)), None
+        )
+        cache[key] = (target, result)
+        return result
 
 
 @dataclass

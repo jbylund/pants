@@ -99,7 +99,7 @@ async def find_changed_owners(
         #
         # Note that we use `UnexpandedTargets` rather than `Targets` or `FilteredTargets` so that
         # we preserve target generators.
-        result_as_tgts = await resolve_unexpanded_targets(Addresses(result))
+        result_as_tgts = await resolve_unexpanded_targets(Addresses(result), **implicitly())
         result = FrozenOrderedSet(
             tgt.address for tgt in result_as_tgts if specs_filter.matches(tgt)
         )
