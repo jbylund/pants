@@ -26,6 +26,7 @@ from pants.engine.internals import native_engine
 from pants.engine.internals.build_files import (
     AddressFamilyDir,
     BuildFileOptions,
+    _get_target_adaptor,
     ensure_address_family,
     find_build_file,
     find_target_adaptor,
@@ -184,18 +185,24 @@ async def _determine_target_adaptor_and_type(
     target_adaptor = await find_target_adaptor(
         TargetAdaptorRequest(req.address, description_of_origin=req.description_of_origin)
     )
+    return _adaptor_and_type(req.address, target_adaptor, registered_target_types)
+
+
+def _adaptor_and_type(
+    address: Address, target_adaptor: TargetAdaptor, registered_target_types: RegisteredTargetTypes
+) -> _AdaptorAndType:
     target_type = registered_target_types.aliases_to_types.get(target_adaptor.type_alias, None)
     if target_type is None:
         raise UnrecognizedTargetTypeException(
             target_adaptor.type_alias,
             registered_target_types,
-            req.address,
+            address,
             target_adaptor.description_of_origin,
         )
     if (
         target_type.deprecated_alias is not None
         and target_type.deprecated_alias == target_adaptor.type_alias
-        and not req.address.is_generated_target
+        and not address.is_generated_target
     ):
         warn_deprecated_target_type(target_type)
     return _AdaptorAndType(target_adaptor, target_type)
@@ -332,16 +339,13 @@ async def _target_generator_overrides(
     return overrides_flattened
 
 
-@rule
-async def resolve_generator_target_requests(
-    req: ResolveTargetGeneratorRequests,
+async def _generator_target_requests(
+    address: Address,
+    adaptor_and_type: _AdaptorAndType,
     union_membership: UnionMembership,
     target_types_to_generate_requests: TargetTypesToGenerateTargetsRequests,
     unmatched_build_file_globs: UnmatchedBuildFileGlobs,
 ) -> ResolvedTargetGeneratorRequests:
-    adaptor_and_type = await _determine_target_adaptor_and_type(
-        _RequestAdaptorAndType(req.address, req.description_of_origin), **implicitly()
-    )
     target_adaptor = adaptor_and_type.adaptor
     target_type = adaptor_and_type.target_type
     if not issubclass(target_type, TargetGenerator):
@@ -352,18 +356,23 @@ async def resolve_generator_target_requests(
         return ResolvedTargetGeneratorRequests()
     generator_fields = dict(target_adaptor.kwargs)
     generators = await _parametrized_target_generators_with_templates(
-        req.address,
+        address,
         target_adaptor,
         target_type,
         generator_fields,
         union_membership,
     )
-    base_generator = _create_target(
-        req.address,
-        target_type,
-        target_adaptor,
-        generator_fields,
-        union_membership,
+    # The overrides depend only on the generator's address and fields.
+    base_generator = (
+        generators[0][0]
+        if len(generators) == 1 and generators[0][0].address == address
+        else _create_target(
+            address,
+            target_type,
+            target_adaptor,
+            generator_fields,
+            union_membership,
+        )
     )
     overrides = await _target_generator_overrides(base_generator, unmatched_build_file_globs)
     return ResolvedTargetGeneratorRequests(
@@ -379,6 +388,25 @@ async def resolve_generator_target_requests(
             )
             for generator, template in generators
         )
+    )
+
+
+@rule
+async def resolve_generator_target_requests(
+    req: ResolveTargetGeneratorRequests,
+    union_membership: UnionMembership,
+    target_types_to_generate_requests: TargetTypesToGenerateTargetsRequests,
+    unmatched_build_file_globs: UnmatchedBuildFileGlobs,
+) -> ResolvedTargetGeneratorRequests:
+    adaptor_and_type = await _determine_target_adaptor_and_type(
+        _RequestAdaptorAndType(req.address, req.description_of_origin), **implicitly()
+    )
+    return await _generator_target_requests(
+        req.address,
+        adaptor_and_type,
+        union_membership,
+        target_types_to_generate_requests,
+        unmatched_build_file_globs,
     )
 
 
@@ -439,11 +467,19 @@ async def resolve_all_generator_target_requests(
 async def resolve_target_parametrizations(
     request: _TargetParametrizationsRequest,
     union_membership: UnionMembership,
+    registered_target_types: RegisteredTargetTypes,
+    target_types_to_generate_requests: TargetTypesToGenerateTargetsRequests,
+    unmatched_build_file_globs: UnmatchedBuildFileGlobs,
     env_name: EnvironmentName,
 ) -> _TargetParametrizations:
     address = request.address
-    adaptor_and_type = await _determine_target_adaptor_and_type(
-        _RequestAdaptorAndType(request.address, request.description_of_origin), **implicitly()
+    address_family = (
+        await parse_address_family(**implicitly(AddressFamilyDir(address.spec_path)))
+    ).ensure()
+    adaptor_and_type = _adaptor_and_type(
+        address,
+        _get_target_adaptor(address, address_family, request.description_of_origin),
+        registered_target_types,
     )
     target_adaptor = adaptor_and_type.adaptor
     target_type = adaptor_and_type.target_type
@@ -451,8 +487,12 @@ async def resolve_target_parametrizations(
     parametrizations: list[_TargetParametrization] = []
     requests: ResolvedTargetGeneratorRequests | None = None
     if issubclass(target_type, TargetGenerator):
-        requests = await resolve_generator_target_requests(
-            ResolveTargetGeneratorRequests(address, request.description_of_origin), **implicitly()
+        requests = await _generator_target_requests(
+            address,
+            adaptor_and_type,
+            union_membership,
+            target_types_to_generate_requests,
+            unmatched_build_file_globs,
         )
     if requests and requests.requests:
         all_generated = await concurrently(
@@ -491,45 +531,83 @@ async def resolve_target(
             }
         )
     )
+    return WrappedTarget(
+        _target_of_parametrizations(
+            address,
+            base_address,
+            parametrizations,
+            target_types_to_generate_requests,
+            request.description_of_origin,
+        )
+    )
+
+
+def _target_of_parametrizations(
+    address: Address,
+    base_address: Address,
+    parametrizations: _TargetParametrizations,
+    target_types_to_generate_requests: TargetTypesToGenerateTargetsRequests,
+    description_of_origin: str,
+) -> Target:
     target = parametrizations.get(address, target_types_to_generate_requests)
     if target is None:
         raise ResolveError(
             softwrap(
                 f"""
-                The address `{address}` from {request.description_of_origin} was not generated by
+                The address `{address}` from {description_of_origin} was not generated by
                 the target `{base_address}`. Did you mean one of these addresses?
 
                 {bullet_list(str(t.address) for t in parametrizations.all)}
                 """
             )
         )
-    return WrappedTarget(target)
+    return target
 
 
 @rule(_masked_types=[EnvironmentName])
-async def resolve_unexpanded_targets(addresses: Addresses) -> UnexpandedTargets:
-    wrapped_targets = await concurrently(
-        resolve_target(
-            WrappedTargetRequest(
-                a,
-                # Idiomatic rules should not be manually constructing `Addresses`. Instead, they
-                # should use `UnparsedAddressInputs` or `Specs` rules.
-                #
-                # It is technically more correct for us to require callers of
-                # `Addresses -> UnexpandedTargets` to specify a `description_of_origin`. But in
-                # practice, this dramatically increases boilerplate, and it should never be
-                # necessary.
-                #
-                # Note that this contrasts with an individual `Address`, which often is unverified
-                # because it can come from the rule `AddressInput -> Address`, which only verifies
-                # that it has legal syntax and does not check the address exists.
-                description_of_origin="<infallible>",
-            ),
-            **implicitly(),
+async def resolve_unexpanded_targets(
+    addresses: Addresses,
+    target_types_to_generate_requests: TargetTypesToGenerateTargetsRequests,
+    local_environment_name: ChosenLocalEnvironmentName,
+) -> UnexpandedTargets:
+    base_addresses = [a.maybe_convert_to_target_generator() for a in addresses]
+    unique_base_addresses = list(dict.fromkeys(base_addresses))
+    parametrizations = await concurrently(
+        resolve_target_parametrizations(
+            **implicitly(
+                {
+                    _TargetParametrizationsRequest(
+                        base_address,
+                        # Idiomatic rules should not be manually constructing `Addresses`. Instead, they
+                        # should use `UnparsedAddressInputs` or `Specs` rules.
+                        #
+                        # It is technically more correct for us to require callers of
+                        # `Addresses -> UnexpandedTargets` to specify a `description_of_origin`. But in
+                        # practice, this dramatically increases boilerplate, and it should never be
+                        # necessary.
+                        #
+                        # Note that this contrasts with an individual `Address`, which often is unverified
+                        # because it can come from the rule `AddressInput -> Address`, which only verifies
+                        # that it has legal syntax and does not check the address exists.
+                        description_of_origin="<infallible>",
+                    ): _TargetParametrizationsRequest,
+                    local_environment_name.val: EnvironmentName,
+                }
+            )
         )
-        for a in addresses
+        for base_address in unique_base_addresses
     )
-    return UnexpandedTargets(wrapped_target.target for wrapped_target in wrapped_targets)
+    parametrizations_by_base = dict(zip(unique_base_addresses, parametrizations))
+    return UnexpandedTargets(
+        _target_of_parametrizations(
+            address,
+            base_address,
+            parametrizations_by_base[base_address],
+            target_types_to_generate_requests,
+            "<infallible>",
+        )
+        for address, base_address in zip(addresses, base_addresses)
+    )
 
 
 _TargetType = TypeVar("_TargetType", bound=Target)
@@ -807,7 +885,9 @@ async def transitive_dependency_mapping(request: _DependencyMappingRequest) -> _
     Unlike a traditional BFS algorithm, we batch each round of traversals via `concurrently` for
     improved performance / concurrency.
     """
-    roots_as_targets = await resolve_unexpanded_targets(Addresses(request.tt_request.roots))
+    roots_as_targets = await resolve_unexpanded_targets(
+        Addresses(request.tt_request.roots), **implicitly()
+    )
     visited: OrderedSet[Target] = OrderedSet()
     queued = FrozenOrderedSet(roots_as_targets)
     dependency_mapping: dict[Address, tuple[Address, ...]] = {}
@@ -1910,12 +1990,13 @@ async def generate_file_target_settings(
 async def generate_file_targets(
     request: GenerateFileTargets,
     union_membership: UnionMembership,
+    unmatched_build_file_globs: UnmatchedBuildFileGlobs,
     environment_name: EnvironmentName,
 ) -> GeneratedTargets:
     try:
-        sources_paths = await resolve_source_paths(
-            SourcesPathsRequest(request.generator[MultipleSourcesField]), **implicitly()
-        )
+        sources_field = request.generator[MultipleSourcesField]
+        paths = await path_globs_to_paths(sources_field.path_globs(unmatched_build_file_globs))
+        sources_field.validate_resolved_files(paths.files)
     except Exception as e:
         tgt = request.generator
         fld = tgt[MultipleSourcesField]
@@ -1943,7 +2024,7 @@ async def generate_file_targets(
     return _generate_file_level_targets(
         type(request.generator).generated_target_cls,
         request.generator,
-        sources_paths.files,
+        paths.files,
         request.template_address,
         request.template,
         request.overrides,

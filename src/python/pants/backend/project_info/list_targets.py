@@ -8,7 +8,7 @@ from pants.engine.addresses import Address, Addresses
 from pants.engine.console import Console
 from pants.engine.goal import Goal, GoalSubsystem, LineOriented
 from pants.engine.internals.graph import resolve_unexpanded_targets
-from pants.engine.rules import collect_rules, goal_rule
+from pants.engine.rules import collect_rules, goal_rule, implicitly
 from pants.engine.target import DescriptionField
 from pants.option.option_types import BoolOption
 
@@ -40,7 +40,7 @@ async def list_targets(
 
     if list_subsystem.documented:
         # We must preserve target generators, not replace with their generated targets.
-        targets = await resolve_unexpanded_targets(addresses)
+        targets = await resolve_unexpanded_targets(addresses, **implicitly())
         addresses_with_descriptions = cast(
             dict[Address, str],
             {
