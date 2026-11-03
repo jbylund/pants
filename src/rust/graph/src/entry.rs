@@ -550,10 +550,14 @@ impl<N: Node> Entry<N> {
                 ..
             } => {
                 if let Some(receiver) = pending_value.receiver() {
+                    // Another request is running this Node: we can only wait for it.
+                    let join_guard = context.join_hook().and_then(|hook| hook.clone().on_join());
                     return async move {
-                        receiver.recv().await.unwrap_or_else(|| {
+                        let result = receiver.recv().await.unwrap_or_else(|| {
                             (Err(N::Error::invalidated()), generation.next(), true)
-                        })
+                        });
+                        drop(join_guard);
+                        result
                     }
                     .boxed();
                 }

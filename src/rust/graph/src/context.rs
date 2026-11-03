@@ -27,6 +27,15 @@ pub(crate) struct DepState {
 }
 
 ///
+/// Called when a request joins a Node which another request is already running, i.e. when the
+/// requester can only wait. The returned guard is held until the Node completes. Used by the engine
+/// to stop counting such waiters against `concurrently(..)` admission windows.
+///
+pub trait JoinHook: Send + Sync {
+    fn on_join(self: Arc<Self>) -> Option<Box<dyn Send>>;
+}
+
+///
 /// A context passed between running Nodes which is used to request and record dependencies.
 ///
 /// Parametrized by:
@@ -36,6 +45,8 @@ pub(crate) struct DepState {
 pub struct Context<N: Node + Send> {
     entry_id: Option<EntryId>,
     dep_state: Arc<Mutex<Option<DepState>>>,
+    // Inherited by the Nodes this context spawns: see `JoinHook`.
+    join_hook: Option<Arc<dyn JoinHook>>,
     inner: Arc<InnerContext<N>>,
 }
 
@@ -49,6 +60,7 @@ impl<N: Node + Send> Context<N> {
         Self {
             entry_id: None,
             dep_state: Arc::default(),
+            join_hook: None,
             inner: Arc::new(InnerContext {
                 context,
                 run_id,
@@ -79,6 +91,18 @@ impl<N: Node + Send> Context<N> {
 
     pub fn run_id(&self) -> RunId {
         self.inner.run_id
+    }
+
+    /// A clone of this Context (for the same Node) with the given `JoinHook`.
+    pub fn with_join_hook(&self, join_hook: Arc<dyn JoinHook>) -> Self {
+        Self {
+            join_hook: Some(join_hook),
+            ..self.clone()
+        }
+    }
+
+    pub fn join_hook(&self) -> Option<&Arc<dyn JoinHook>> {
+        self.join_hook.as_ref()
     }
 
     pub fn context(&self) -> &N::Context {
@@ -145,6 +169,7 @@ impl<N: Node + Send> Context<N> {
         Self {
             entry_id: Some(entry_id),
             dep_state: Arc::new(Mutex::new(Some(DepState::default()))),
+            join_hook: self.join_hook.clone(),
             inner: self.inner.clone(),
         }
     }
