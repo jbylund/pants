@@ -28,7 +28,7 @@ use task_executor::Executor;
 use tokio::time::sleep;
 use workunit_store::RunId;
 
-pub use crate::context::Context;
+pub use crate::context::{Context, JoinHook};
 pub use crate::node::{CompoundNode, EntryId, Node, NodeError};
 
 type PGraph<N> = DiGraph<Entry<N>, (), u32>;

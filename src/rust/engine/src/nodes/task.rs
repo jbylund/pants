@@ -7,8 +7,9 @@ use std::sync::atomic::AtomicBool;
 
 use deepsize::DeepSizeOf;
 use futures::future::{self, BoxFuture, FutureExt};
-use graph::CompoundNode;
+use graph::{CompoundNode, JoinHook};
 use internment::Intern;
+use parking_lot::Mutex;
 use pyo3::prelude::{PyAnyMethods, PyErr, Python};
 use pyo3::types::{PyDict, PyDictMethods, PyTuple};
 use pyo3::{Bound, IntoPyObject};
@@ -37,6 +38,85 @@ pub struct Task {
     // Does not affect the identity of the Task.
     #[derivative(PartialEq = "ignore", Hash = "ignore")]
     pub(super) side_effected: Arc<AtomicBool>,
+}
+
+// EXPERIMENT (lend-back): the parked pool of a `concurrently(..)` call is this many times its window,
+// so a call admits at most `window * (1 + PARKED_PER_WINDOW_PERMIT)` items.
+const PARKED_PER_WINDOW_PERMIT: usize = 4;
+
+/// The admission of one `concurrently(..)` item. While any request in the item's subgraph is only
+/// waiting on a Node that another request is running (a graph "join"), the item gives its window
+/// permit back in exchange for a parked permit, so that the window admits other items. When the last
+/// join completes, it takes a window permit back if one is free, and otherwise stays parked. Nothing
+/// here blocks after admission, so this adds no waits that could deadlock.
+struct Admission {
+    window: Arc<tokio::sync::Semaphore>,
+    parked: Arc<tokio::sync::Semaphore>,
+    // The admission of the enclosing `concurrently(..)` item, if any: it is waiting too.
+    parent: Option<Arc<dyn JoinHook>>,
+    state: Mutex<AdmissionState>,
+}
+
+struct AdmissionState {
+    slot: Slot,
+    joins: usize,
+}
+
+enum Slot {
+    Window(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit),
+    Parked(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit),
+    // The item completed (or was canceled): background work in its subgraph no longer counts.
+    Released,
+}
+
+impl JoinHook for Admission {
+    fn on_join(self: Arc<Self>) -> Option<Box<dyn Send>> {
+        {
+            let mut state = self.state.lock();
+            if matches!(state.slot, Slot::Released) {
+                return None;
+            }
+            state.joins += 1;
+            if state.joins == 1
+                && matches!(state.slot, Slot::Window(_))
+                && let Ok(parked) = self.parked.clone().try_acquire_owned()
+            {
+                // Dropping the window permit returns it to the window.
+                state.slot = Slot::Parked(parked);
+            }
+        }
+        let parent_guard = self.parent.as_ref().and_then(|p| p.clone().on_join());
+        Some(Box::new(JoinGuard {
+            admission: self,
+            _parent_guard: parent_guard,
+        }))
+    }
+}
+
+struct JoinGuard {
+    admission: Arc<Admission>,
+    _parent_guard: Option<Box<dyn Send>>,
+}
+
+impl Drop for JoinGuard {
+    fn drop(&mut self) {
+        let mut state = self.admission.state.lock();
+        state.joins -= 1;
+        if state.joins == 0
+            && matches!(state.slot, Slot::Parked(_))
+            && let Ok(window) = self.admission.window.clone().try_acquire_owned()
+        {
+            state.slot = Slot::Window(window);
+        }
+    }
+}
+
+struct ReleaseOnDrop(Arc<Admission>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.state.lock().slot = Slot::Released;
+    }
 }
 
 impl Task {
@@ -167,15 +247,33 @@ impl Task {
             ),
         );
         let semaphore = Arc::new(tokio::sync::Semaphore::new(window));
+        // Items which are only waiting on a Node that another request is running move from the window
+        // onto this pool, so they don't block the window: see `Admission`.
+        let parked = Arc::new(tokio::sync::Semaphore::new(window * PARKED_PER_WINDOW_PERMIT));
+        let parent = context.join_hook().cloned();
         let futures = items.into_iter().map(|item| {
             let semaphore = semaphore.clone();
+            let parked = parked.clone();
+            let parent = parent.clone();
             let params = params.clone();
             async move {
-                let _permit = semaphore
-                    .acquire()
+                let permit = semaphore
+                    .clone()
+                    .acquire_owned()
                     .await
                     .expect("The semaphore is never closed.");
-                Self::gen_all_item(context, params, entry, item).await
+                let admission = Arc::new(Admission {
+                    window: semaphore,
+                    parked,
+                    parent,
+                    state: Mutex::new(AdmissionState {
+                        slot: Slot::Window(permit),
+                        joins: 0,
+                    }),
+                });
+                let _release = ReleaseOnDrop(admission.clone());
+                let item_context = context.with_join_hook(admission);
+                Self::gen_all_item(&item_context, params, entry, item).await
             }
         });
         future::try_join_all(futures).await
