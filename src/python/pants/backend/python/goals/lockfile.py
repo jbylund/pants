@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import itertools
 import os.path
+import tomllib
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from operator import itemgetter
 from typing import cast
 
@@ -43,7 +44,12 @@ from pants.backend.python.util_rules.pex_requirements import (
     load_lockfile,
     strip_comments_from_pex_json_lockfile,
 )
-from pants.backend.python.util_rules.uv import UvEnvironment, generate_pyproject_toml
+from pants.backend.python.util_rules.uv import (
+    UvEnvironment,
+    generate_pyproject_toml,
+    relativize_local_find_links,
+)
+from pants.base.build_root import BuildRoot
 from pants.base.glob_match_error_behavior import GlobMatchErrorBehavior
 from pants.core.goals.generate_lockfiles import (
     DEFAULT_TOOL_LOCKFILE,
@@ -351,6 +357,7 @@ async def generate_uv_lockfile(
     generate_lockfiles_subsystem: GenerateLockfilesSubsystem,
     downloaded_uv: DownloadedUv,
     uv_env: UvEnvironment,
+    buildroot: BuildRoot,
     level: LogLevel,
 ) -> GenerateLockfileResult:
     if not req.interpreter_constraints:
@@ -364,12 +371,18 @@ async def generate_uv_lockfile(
     )
     resolve_config.validate_for_uv(req.resolve_name)
 
+    resolve_find_links, resolve_local_find_links_globs = relativize_local_find_links(
+        resolve_config.find_links, buildroot.path
+    )
+    extra_find_links, extra_local_find_links_globs = relativize_local_find_links(
+        req.find_links, buildroot.path
+    )
     pyproject_content = generate_pyproject_toml(
         req.resolve_name,
         req.interpreter_constraints,
         req.requirements,
         indexes=resolve_config.indexes,
-        find_links=(*resolve_config.find_links, *req.find_links),
+        find_links=(*resolve_find_links, *extra_find_links),
         sources=resolve_config.sources,
     )
 
@@ -403,12 +416,12 @@ async def generate_uv_lockfile(
                     raise ValueError(
                         f"Expected lockfile entry to be a FileEntry but was a {type(repo_lock_entry)}"
                     )
-        except IntrinsicError:
-            # May fail if the file doesn't exist, which is expected the first time a new lockfile
-            # is generated.
+        except (IntrinsicError, tomllib.TOMLDecodeError):
+            # May fail if the file doesn't exist or is malformed, which is expected the first time
+            # a new lockfile is generated or when the existing one needs to be overwritten.
             pass
 
-    uv_config = resolve_config.uv_config()
+    uv_config = replace(resolve_config, find_links=resolve_find_links).uv_config()
 
     uv_config_digest = await create_digest(
         CreateDigest(
@@ -418,9 +431,13 @@ async def generate_uv_lockfile(
             ]
         )
     )
-
+    find_links_digest = await path_globs_to_digest(
+        PathGlobs((*resolve_local_find_links_globs.globs, *extra_local_find_links_globs.globs))
+    )
     input_digest = await merge_digests(
-        MergeDigests([downloaded_uv.digest, uv_config_digest, existing_uv_lock_digest])
+        MergeDigests(
+            [downloaded_uv.digest, uv_config_digest, existing_uv_lock_digest, find_links_digest]
+        )
     )
 
     result = await execute_process_or_raise(
