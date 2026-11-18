@@ -889,6 +889,35 @@ def _get_field_set_fields_from_target(
 _FS = TypeVar("_FS", bound="FieldSet")
 
 
+# Whether a FieldSet's required fields are registered on a target, which depends only on the target's
+# type and registered fields: keyed by (FieldSet type, Target type, registered Field types).
+_FIELD_SET_HAS_FIELDS: dict[tuple[type, type, tuple[type, ...]], bool] = {}
+_APPLICABLE_FIELD_SET_CANDIDATES: dict[tuple, tuple[tuple[type[FieldSet], bool], ...]] = {}
+
+
+def applicable_field_set_types(
+    field_set_types: tuple[type[FieldSet], ...], tgt: Target
+) -> list[type[FieldSet]]:
+    """The `field_set_types` which are applicable to `tgt` (per `FieldSet.is_applicable`), in
+    order."""
+    key = (field_set_types, type(tgt), tuple(tgt.field_values))
+    candidates = _APPLICABLE_FIELD_SET_CANDIDATES.get(key)
+    if candidates is None:
+        candidates = _APPLICABLE_FIELD_SET_CANDIDATES[key] = tuple(
+            (
+                field_set_type,
+                field_set_type.opt_out.__func__ is not FieldSet.opt_out.__func__,  # type: ignore[attr-defined]
+            )
+            for field_set_type in field_set_types
+            if tgt.has_fields(field_set_type.required_fields)
+        )
+    return [
+        field_set_type
+        for field_set_type, may_opt_out in candidates
+        if not (may_opt_out and field_set_type.opt_out(tgt))
+    ]
+
+
 @dataclass(frozen=True)
 class FieldSet(EngineAwareParameter, metaclass=ABCMeta):
     """An ad hoc set of fields from a target which are used by rules.
@@ -950,7 +979,12 @@ class FieldSet(EngineAwareParameter, metaclass=ABCMeta):
     @final
     @classmethod
     def is_applicable(cls, tgt: Target) -> bool:
-        return tgt.has_fields(cls.required_fields) and not cls.opt_out(tgt)
+        key = (cls, type(tgt), tuple(tgt.field_values))
+        has_fields = _FIELD_SET_HAS_FIELDS.get(key)
+        if has_fields is None:
+            has_fields = tgt.has_fields(cls.required_fields)
+            _FIELD_SET_HAS_FIELDS[key] = has_fields
+        return has_fields and not cls.opt_out(tgt)
 
     @final
     @classmethod
@@ -1917,6 +1951,62 @@ class ValidateDependenciesRequest(Generic[FS], ABC):
 @dataclass(frozen=True)
 class ValidatedDependencies:
     pass
+
+
+@union(in_scope_types=[EnvironmentName])
+@dataclass(frozen=True)
+class BulkInferDependenciesRequest:
+    """Infer dependencies for many targets at once, with exactly the outcome of running the
+    `InferDependenciesRequest` implementation named by `infers` for each of them.
+
+    Implementations may omit targets, which are then inferred individually (which reports any
+    failure).
+    """
+
+    infers: ClassVar[type[InferDependenciesRequest]]
+
+    field_sets: tuple[FieldSet, ...]
+
+
+@dataclass(frozen=True)
+class BulkInferredDependencies:
+    dependencies: FrozenDict[Address, InferredDependencies]
+
+
+@dataclass(frozen=True)
+class BulkDependenciesRequest:
+    """Resolve the direct dependencies of many targets as a `DependenciesRequest` which always
+    traverses would.
+
+    The results of dependency inference may be supplied by the caller: for targets without them,
+    the applicable `InferDependenciesRequest` implementations are run.
+    """
+
+    targets: tuple[Target, ...]
+    inferred: FrozenDict[Address, tuple[InferredDependencies, ...]]
+    # The (unfilled) explicitly provided dependencies of some targets, if already known.
+    explicit: FrozenDict[Address, ExplicitlyProvidedDependencies] = FrozenDict()
+    # The `InferDependenciesRequest` types applicable to every target (in union order), if known.
+    inference_types: tuple[type[InferDependenciesRequest], ...] | None = None
+
+
+@dataclass(frozen=True)
+class BulkDependencies:
+    """The unexpanded dependencies of each target, or of none of them if any failed to resolve (in
+    which case they should be resolved individually, which reports the failure)."""
+
+    dependencies: FrozenDict[Address, Addresses]
+
+
+@union(in_scope_types=[EnvironmentName])
+@dataclass(frozen=True)
+class BulkValidateDependenciesRequest:
+    """Validates the dependencies of many targets at once, with exactly the outcome of running the
+    `ValidateDependenciesRequest` implementation named by `validates` for each of them."""
+
+    validates: ClassVar[type[ValidateDependenciesRequest]]
+
+    targets_and_dependencies: tuple[tuple[Target, Addresses], ...]
 
 
 @dataclass(frozen=True)

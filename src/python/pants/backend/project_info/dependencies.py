@@ -60,7 +60,7 @@ async def list_dependencies_as_json(
     """Get dependencies for given addresses and list them in the console in JSON."""
     # NB: We must preserve target generators for the roots, i.e. not replace with their
     # generated targets.
-    target_roots = await resolve_unexpanded_targets(addresses)
+    target_roots = await resolve_unexpanded_targets(addresses, **implicitly())
     # NB: When determining dependencies, though, we replace target generators with their
     # generated targets.
     if dependencies_subsystem.transitive:
@@ -130,7 +130,7 @@ async def list_dependencies_as_plain_text(
     else:
         # NB: We must preserve target generators for the roots, i.e. not replace with their
         # generated targets.
-        target_roots = await resolve_unexpanded_targets(addresses)
+        target_roots = await resolve_unexpanded_targets(addresses, **implicitly())
         # NB: When determining dependencies, though, we replace target generators with their
         # generated targets.
         dependencies_per_target_root = await concurrently(

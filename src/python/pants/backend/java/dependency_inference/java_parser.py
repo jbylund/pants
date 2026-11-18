@@ -30,9 +30,10 @@ from pants.engine.process import (
 )
 from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.unions import UnionRule
-from pants.jvm.jdk_rules import InternalJdk, JvmProcess
+from pants.jvm.jdk_rules import InternalJdk, JvmProcess, internal_jdk
 from pants.jvm.resolve.coursier_fetch import ToolClasspathRequest, materialize_classpath_for_tool
 from pants.jvm.resolve.jvm_tool import GenerateJvmLockfileFromTool, JvmToolBase
+from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
 
 logger = logging.getLogger(__name__)
@@ -154,6 +155,79 @@ async def analyze_java_source_dependencies(
     return FallibleJavaSourceDependencyAnalysisResult(process_result=process_result)
 
 
+@dataclass(frozen=True)
+class JavaSourcesBatchRequest:
+    """Analyze several Java sources, given as (path, single-file digest) pairs, in one process."""
+
+    files: tuple[tuple[str, Digest], ...]
+
+
+@dataclass(frozen=True)
+class JavaSourcesBatchAnalysis:
+    """The analyses of the sources which could be analyzed; others are absent."""
+
+    by_file: FrozenDict[str, JavaSourceDependencyAnalysis]
+
+
+@rule(level=LogLevel.DEBUG)
+async def analyze_java_sources_batch(
+    request: JavaSourcesBatchRequest,
+    processor_classfiles: JavaParserCompiledClassfiles,
+    jdk: InternalJdk,
+    tool: JavaParser,
+) -> JavaSourcesBatchAnalysis:
+    if len(request.files) < 2:
+        return JavaSourcesBatchAnalysis(FrozenDict())
+    source_prefix = "__source_to_analyze"
+    processorcp_relpath = "__processorcp"
+    toolcp_relpath = "__toolcp"
+    tool_classpath, merged_sources = await concurrently(
+        materialize_classpath_for_tool(
+            ToolClasspathRequest(lockfile=(GenerateJvmLockfileFromTool.create(tool)))
+        ),
+        merge_digests(MergeDigests(digest for _, digest in request.files)),
+    )
+    prefixed_sources = await add_prefix(AddPrefix(merged_sources, source_prefix))
+    extra_immutable_input_digests = {
+        toolcp_relpath: tool_classpath.digest,
+        processorcp_relpath: processor_classfiles.digest,
+    }
+    output_paths = [f"__source_analysis_{i}.json" for i in range(len(request.files))]
+    argv: list[str] = ["org.pantsbuild.javaparser.PantsJavaParserLauncher"]
+    for output_path, (path, _) in zip(output_paths, request.files):
+        argv.extend((output_path, os.path.join(source_prefix, path)))
+    process_result = await execute_process(
+        **implicitly(
+            JvmProcess(
+                jdk=jdk,
+                classpath_entries=[
+                    *tool_classpath.classpath_entries(toolcp_relpath),
+                    processorcp_relpath,
+                ],
+                argv=argv,
+                input_digest=prefixed_sources,
+                extra_immutable_input_digests=extra_immutable_input_digests,
+                output_files=tuple(output_paths),
+                extra_nailgun_keys=extra_immutable_input_digests,
+                description=f"Analyzing {len(request.files)} Java sources",
+                level=LogLevel.DEBUG,
+            )
+        )
+    )
+    if process_result.exit_code != 0:
+        return JavaSourcesBatchAnalysis(FrozenDict())
+    contents = {
+        fc.path: fc.content for fc in await get_digest_contents(process_result.output_digest)
+    }
+    return JavaSourcesBatchAnalysis(
+        FrozenDict(
+            (path, JavaSourceDependencyAnalysis.from_json_dict(json.loads(contents[output_path])))
+            for output_path, (path, _) in zip(output_paths, request.files)
+            if output_path in contents
+        )
+    )
+
+
 def _load_javaparser_launcher_source() -> bytes:
     parent_module = ".".join(__name__.split(".")[:-1])
     return importlib.resources.files(parent_module).joinpath(_LAUNCHER_BASENAME).read_bytes()
@@ -161,9 +235,11 @@ def _load_javaparser_launcher_source() -> bytes:
 
 # TODO(13879): Consolidate compilation of wrapper binaries to common rules.
 @rule
-async def build_processors(jdk: InternalJdk, tool: JavaParser) -> JavaParserCompiledClassfiles:
+async def build_processors(tool: JavaParser) -> JavaParserCompiledClassfiles:
     dest_dir = "classfiles"
-    materialized_classpath, source_digest = await concurrently(
+    # The tool's classpath does not depend on the JDK: fetch both at once.
+    jdk, materialized_classpath, source_digest = await concurrently(
+        internal_jdk(**implicitly()),
         materialize_classpath_for_tool(
             ToolClasspathRequest(
                 prefix="__toolcp", lockfile=GenerateJvmLockfileFromTool.create(tool)

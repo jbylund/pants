@@ -5,6 +5,7 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use futures::{StreamExt, TryStreamExt};
 use fs::{
     DigestTrie, DirectoryDigest, GlobMatching, PathGlobs, PathStat, RelativePath, SymlinkBehavior,
     TypedPath,
@@ -16,7 +17,7 @@ use pyo3::{Bound, IntoPyObject, PyAny};
 use store::{SnapshotOps, SubsetParams};
 
 use crate::externs;
-use crate::externs::PyGeneratorResponseNativeCall;
+use crate::externs::{DeferredValue, PyGeneratorResponseNativeCall};
 use crate::externs::fs::{
     PyAddPrefix, PyFileDigest, PyMergeDigests, PyPathMetadata, PyPathNamespace, PyRemovePrefix,
 };
@@ -25,7 +26,7 @@ use crate::nodes::{
     task_get_context, unmatched_globs_additional_context,
 };
 use crate::python::{Key, Value, throw};
-use crate::{Context, Failure};
+use crate::Failure;
 
 pub fn register(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(add_prefix, m)?)?;
@@ -38,6 +39,7 @@ pub fn register(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(merge_digests, m)?)?;
     m.add_function(wrap_pyfunction!(path_globs_to_digest, m)?)?;
     m.add_function(wrap_pyfunction!(path_globs_to_paths, m)?)?;
+    m.add_function(wrap_pyfunction!(path_globs_to_snapshots, m)?)?;
     m.add_function(wrap_pyfunction!(remove_prefix, m)?)?;
     m.add_function(wrap_pyfunction!(path_metadata_request, m)?)?;
 
@@ -45,20 +47,14 @@ pub fn register(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[pyfunction]
-fn get_digest_contents(digest: Value) -> PyGeneratorResponseNativeCall {
-    PyGeneratorResponseNativeCall::new(async move {
+fn get_digest_contents(py: Python, digest: Value) -> PyGeneratorResponseNativeCall {
+    let digest = lift_directory_digest(digest.bind(py));
+    PyGeneratorResponseNativeCall::new_deferred(async move {
         let context = task_get_context();
-
-        let digest = Python::attach(|py| {
-            let py_digest = digest.bind(py);
-            lift_directory_digest(py_digest)
-        })?;
-
-        let digest_contents = context.core.store().contents_for_directory(digest).await?;
-
-        Ok::<_, Failure>(Python::attach(|py| {
-            Snapshot::store_digest_contents(py, &context, &digest_contents)
-        })?)
+        let digest_contents = context.core.store().contents_for_directory(digest?).await?;
+        Ok::<DeferredValue, Failure>(Box::new(move |py| {
+            Ok(Snapshot::store_digest_contents(py, &context, &digest_contents)?)
+        }))
     })
 }
 
@@ -79,24 +75,23 @@ fn get_digest_entries(digest: Value) -> PyGeneratorResponseNativeCall {
 }
 
 #[pyfunction]
-fn remove_prefix(remove_prefix: Value) -> PyGeneratorResponseNativeCall {
-    PyGeneratorResponseNativeCall::new(async move {
+fn remove_prefix(py: Python, remove_prefix: Value) -> PyGeneratorResponseNativeCall {
+    let args: Result<_, Failure> = (|| {
+        let py_remove_prefix = remove_prefix
+            .bind(py)
+            .extract::<PyRef<PyRemovePrefix>>()
+            .map_err(|e| throw(format!("{e}")))?;
+        let prefix = RelativePath::new(&py_remove_prefix.prefix)
+            .map_err(|e| throw(format!("The `prefix` must be relative: {e}")))?;
+        Ok((py_remove_prefix.digest.clone(), prefix))
+    })();
+    PyGeneratorResponseNativeCall::new_deferred(async move {
         let context = task_get_context();
-
-        let (digest, prefix) = Python::attach(|py| {
-            let py_remove_prefix = remove_prefix
-                .bind(py)
-                .extract::<PyRef<PyRemovePrefix>>()
-                .map_err(|e| throw(format!("{e}")))?;
-            let prefix = RelativePath::new(&py_remove_prefix.prefix)
-                .map_err(|e| throw(format!("The `prefix` must be relative: {e}")))?;
-            let res: NodeResult<_> = Ok((py_remove_prefix.digest.clone(), prefix));
-            res
-        })?;
+        let (digest, prefix) = args?;
         let digest = context.core.store().strip_prefix(digest, &prefix).await?;
-        Ok::<_, Failure>(Python::attach(|py| {
-            Snapshot::store_directory_digest(py, digest)
-        })?)
+        Ok::<DeferredValue, Failure>(Box::new(move |py| {
+            Ok(Snapshot::store_directory_digest(py, digest)?)
+        }))
     })
 }
 
@@ -124,39 +119,31 @@ fn add_prefix(add_prefix: Value) -> PyGeneratorResponseNativeCall {
 }
 
 #[pyfunction]
-fn digest_to_snapshot(digest: Value) -> PyGeneratorResponseNativeCall {
-    PyGeneratorResponseNativeCall::new(async move {
+fn digest_to_snapshot(py: Python, digest: Value) -> PyGeneratorResponseNativeCall {
+    let digest = lift_directory_digest(digest.bind(py));
+    PyGeneratorResponseNativeCall::new_deferred(async move {
         let context = task_get_context();
         let store = context.core.store();
-
-        let digest = Python::attach(|py| {
-            let py_digest = digest.bind(py);
-            lift_directory_digest(py_digest)
-        })?;
-        let snapshot = store::Snapshot::from_digest(store, digest).await?;
-        Ok::<_, Failure>(Python::attach(|py| Snapshot::store_snapshot(py, snapshot))?)
+        let snapshot = store::Snapshot::from_digest(store, digest?).await?;
+        Ok::<DeferredValue, Failure>(Box::new(move |py| {
+            Ok(Snapshot::store_snapshot(py, snapshot)?)
+        }))
     })
 }
 
 #[pyfunction]
-fn merge_digests(digests: Value) -> PyGeneratorResponseNativeCall {
-    PyGeneratorResponseNativeCall::new(async move {
+fn merge_digests(py: Python, digests: Value) -> PyGeneratorResponseNativeCall {
+    let digests = digests
+        .bind(py)
+        .extract::<PyRef<PyMergeDigests>>()
+        .map(|py_merge_digests| py_merge_digests.0.clone())
+        .map_err(|e| throw(format!("{e}")));
+    PyGeneratorResponseNativeCall::new_deferred(async move {
         let context = task_get_context();
-
-        let core = &context.core;
-        let store = core.store();
-
-        let digests = Python::attach(|py| {
-            digests
-                .bind(py)
-                .extract::<PyRef<PyMergeDigests>>()
-                .map(|py_merge_digests| py_merge_digests.0.clone())
-                .map_err(|e| throw(format!("{e}")))
-        })?;
-        let digest = store.merge(digests).await?;
-        Ok::<_, Failure>(Python::attach(|py| {
-            Snapshot::store_directory_digest(py, digest)
-        })?)
+        let digest = context.core.store().merge(digests?).await?;
+        Ok::<DeferredValue, Failure>(Box::new(move |py| {
+            Ok(Snapshot::store_directory_digest(py, digest)?)
+        }))
     })
 }
 
@@ -174,44 +161,59 @@ fn download_file(download_file: Value) -> PyGeneratorResponseNativeCall {
 }
 
 #[pyfunction]
-fn path_globs_to_digest(path_globs: Value) -> PyGeneratorResponseNativeCall {
-    PyGeneratorResponseNativeCall::new(async move {
+fn path_globs_to_digest(py: Python, path_globs: Value) -> PyGeneratorResponseNativeCall {
+    let path_globs = lift_bound_path_globs(path_globs.bind(py));
+    PyGeneratorResponseNativeCall::new_deferred(async move {
         let context = task_get_context();
-        let digest = inner_path_globs_to_digest(path_globs, &context).await?;
-        Ok(Python::attach(|py| {
-            Snapshot::store_directory_digest(py, digest)
-        })?)
+        let digest: DirectoryDigest = context
+            .get(Snapshot::from_path_globs(path_globs?))
+            .await?
+            .into();
+        Ok::<DeferredValue, Failure>(Box::new(move |py| {
+            Ok(Snapshot::store_directory_digest(py, digest)?)
+        }))
     })
 }
 
-async fn inner_path_globs_to_digest(
-    path_globs: Value,
-    context: &Context,
-) -> Result<DirectoryDigest, Failure> {
-    let path_globs = lift_python_path_globs(path_globs)?;
-    Ok(context
-        .get(Snapshot::from_path_globs(path_globs))
-        .await?
-        .into())
+fn lift_bound_path_globs(path_globs: &Bound<'_, PyAny>) -> Result<PathGlobs, Failure> {
+    Snapshot::lift_path_globs(path_globs).map_err(|e| throw(format!("Failed to parse PathGlobs: {e}")))
 }
 
-fn lift_python_path_globs(path_globs: Value) -> Result<PathGlobs, Failure> {
-    Python::attach(|py| {
-        let py_path_globs = path_globs.bind(py);
-        Snapshot::lift_path_globs(py_path_globs)
+/// Snapshot each of a tuple of PathGlobs, converting all the results in one step.
+#[pyfunction]
+fn path_globs_to_snapshots(py: Python, path_globs: Value) -> PyGeneratorResponseNativeCall {
+    let path_globs: Result<Vec<PathGlobs>, Failure> = externs::collect_iterable(path_globs.bind(py))
+        .map_err(|e| throw(format!("Failed to collect PathGlobs: {e}")))
+        .and_then(|items| items.iter().map(lift_bound_path_globs).collect());
+    PyGeneratorResponseNativeCall::new_deferred(async move {
+        let context = task_get_context();
+        // Bounded like a `concurrently(..)` of individual requests.
+        let parallelism = std::cmp::max(64, context.core.local_parallelism * 4);
+        let snapshots: Vec<store::Snapshot> = futures::stream::iter(
+            path_globs?
+                .into_iter()
+                .map(|path_globs| context.get(Snapshot::from_path_globs(path_globs))),
+        )
+        .buffered(parallelism)
+        .try_collect()
+        .await?;
+        Ok::<DeferredValue, Failure>(Box::new(move |py| {
+            let values = snapshots
+                .into_iter()
+                .map(|snapshot| Snapshot::store_snapshot(py, snapshot))
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(externs::store_tuple(py, values)?)
+        }))
     })
-    .map_err(|e| throw(format!("Failed to parse PathGlobs: {e}")))
 }
 
 #[pyfunction]
-fn path_globs_to_paths(path_globs: Value) -> PyGeneratorResponseNativeCall {
-    PyGeneratorResponseNativeCall::new(async move {
+fn path_globs_to_paths(py: Python, path_globs: Value) -> PyGeneratorResponseNativeCall {
+    let path_globs = lift_bound_path_globs(path_globs.bind(py));
+    PyGeneratorResponseNativeCall::new_deferred(async move {
         let context = task_get_context();
-        let core = &context.core;
-
-        let path_globs = lift_python_path_globs(path_globs)?;
-
-        let path_globs = path_globs.parse().map_err(throw)?;
+        let paths_type = context.core.types.paths;
+        let path_globs = path_globs?.parse().map_err(throw)?;
         let path_stats = context
             .expand_globs(
                 path_globs,
@@ -219,8 +221,7 @@ fn path_globs_to_paths(path_globs: Value) -> PyGeneratorResponseNativeCall {
                 unmatched_globs_additional_context(),
             )
             .await?;
-
-        Python::attach(|py| {
+        Ok::<DeferredValue, Failure>(Box::new(move |py| {
             let mut files = Vec::new();
             let mut dirs = Vec::new();
             for ps in path_stats.iter() {
@@ -236,15 +237,15 @@ fn path_globs_to_paths(path_globs: Value) -> PyGeneratorResponseNativeCall {
                     }
                 }
             }
-            Ok::<_, Failure>(externs::unsafe_call(
+            Ok(externs::unsafe_call(
                 py,
-                core.types.paths,
+                paths_type,
                 &[
                     externs::store_tuple(py, files)?,
                     externs::store_tuple(py, dirs)?,
                 ],
             ))
-        })
+        }))
     })
 }
 
