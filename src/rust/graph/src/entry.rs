@@ -574,11 +574,14 @@ impl<N: Node> Entry<N> {
                 if let Some(receiver) = pending_value.receiver() {
                     let entry = self.clone();
                     let context = context.clone();
+                    // Another request is running this Node: we can only wait for it.
+                    let join_guard = context.join_hook().and_then(|hook| hook.clone().on_join());
                     return async move {
                         let node_result = receiver
                             .recv()
                             .await
                             .unwrap_or_else(|| NodeResult::invalidated(generation));
+                        drop(join_guard);
                         match node_result.run_scope {
                             Some(run_id)
                                 if node_result.result.is_ok() && run_id != context.run_id() =>
